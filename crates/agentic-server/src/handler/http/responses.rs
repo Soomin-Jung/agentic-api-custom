@@ -26,7 +26,22 @@ async fn proxy_responses(state: &AppState, parts: Parts, body: Bytes) -> Respons
     convert_response(proxy_request(proxy_req, &state.proxy_state).await)
 }
 
+fn streaming_preflight_error(payload: &RequestPayload) -> Option<Response> {
+    if !payload.stream {
+        return None;
+    }
+
+    payload
+        .to_upstream_request(true)
+        .err()
+        .map(|error| executor_error_response(error.into()))
+}
+
 async fn execute_responses(state: &AppState, parts: Parts, payload: RequestPayload) -> Response {
+    if let Some(response) = streaming_preflight_error(&payload) {
+        return response;
+    }
+
     let auth = extract_bearer(&parts.headers, state.openai_api_key.as_deref());
     match ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_auth(auth)
@@ -93,5 +108,80 @@ pub async fn compact_response(State(state): State<AppState>, req: Request) -> Re
     match execute_compaction(request, state.exec_ctx.as_ref(), auth.as_deref()).await {
         Ok(response) => axum::Json(response).into_response(),
         Err(error) => executor_error_response(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{StatusCode, header};
+
+    fn request(value: serde_json::Value) -> RequestPayload {
+        serde_json::from_value(value).expect("valid request payload")
+    }
+
+    #[test]
+    fn streaming_preflight_returns_http_400_for_unsupported_custom_tool_format() {
+        let payload = request(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "stream": true,
+            "store": true,
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }]
+        }));
+
+        let response = streaming_preflight_error(&payload).expect("invalid custom tool must fail preflight");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn streaming_preflight_allows_valid_requests() {
+        let payload = request(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "stream": true,
+            "store": true,
+            "tools": [{
+                "type": "function",
+                "name": "echo",
+                "parameters": {"type": "object"}
+            }]
+        }));
+
+        assert!(streaming_preflight_error(&payload).is_none());
+    }
+
+    #[test]
+    fn non_streaming_requests_keep_existing_validation_path() {
+        let payload = request(serde_json::json!({
+            "model": "test-model",
+            "input": "hello",
+            "stream": false,
+            "store": true,
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }]
+        }));
+
+        assert!(streaming_preflight_error(&payload).is_none());
     }
 }
