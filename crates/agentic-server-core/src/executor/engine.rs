@@ -22,11 +22,12 @@ use super::gateway::{
 };
 use super::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, error_sse_chunk};
 use crate::events::EventFrame;
-use crate::executor::error::ExecutorResult;
+use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::DONE_MARKER;
 use crate::executor::persist::persist_if_needed;
 use crate::executor::rehydrate::rehydrate_conversation;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::stream_commit::{InitialStreamCommitGate, initial_stream_commit_gate};
 use crate::executor::upstream::{emit_deferred_stream_events, fetch_blocking_payload, fetch_stream_payload};
 use crate::tool::{ToolRegistry, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
@@ -36,6 +37,8 @@ use crate::utils::common::utcnow_str;
 pub use crate::executor::inference::BoxStream;
 
 const MAX_GATEWAY_TOOL_ROUNDS: usize = 10;
+
+type StreamRunResult = (ExecutorResult<(ResponsePayload, RequestContext)>, GatewayStreamAccumulator);
 
 fn add_usage(total: ResponseUsage, usage: ResponseUsage) -> ResponseUsage {
     ResponseUsage {
@@ -100,10 +103,14 @@ async fn run_until_gateway_tools_complete(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     stream_upstream: bool,
+    mut initial_commit_gate: Option<&mut InitialStreamCommitGate>,
     mut stream: Option<(&mut GatewayStreamAccumulator, &mpsc::UnboundedSender<StreamEvent>)>,
 ) -> ExecutorResult<(ResponsePayload, RequestContext)> {
     if ctx.enriched_request.input.has_compaction_trigger() {
         let (payload, ctx) = run_compaction_trigger(ctx, exec_ctx, auth).await?;
+        if let Some(gate) = initial_commit_gate.as_deref_mut() {
+            gate.ready_and_wait().await?;
+        }
         if let Some((stream_accumulator, stream_sender)) = stream.as_mut() {
             emit_response_start_events(&payload, stream_accumulator, stream_sender)?;
             let event_plans = compaction_event_plans(&payload.output, 0);
@@ -113,7 +120,15 @@ async fn run_until_gateway_tools_complete(
         return Ok((payload, ctx));
     }
 
-    run_gateway_tool_loop(ctx, exec_ctx, auth, stream_upstream, stream).await
+    run_gateway_tool_loop(
+        ctx,
+        exec_ctx,
+        auth,
+        stream_upstream,
+        initial_commit_gate,
+        stream,
+    )
+    .await
 }
 
 async fn run_gateway_tool_loop(
@@ -121,6 +136,7 @@ async fn run_gateway_tool_loop(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     stream_upstream: bool,
+    mut initial_commit_gate: Option<&mut InitialStreamCommitGate>,
     mut stream: Option<(&mut GatewayStreamAccumulator, &mpsc::UnboundedSender<StreamEvent>)>,
 ) -> ExecutorResult<(ResponsePayload, RequestContext)> {
     let mut executors = exec_ctx.gateway_executors.request_scoped();
@@ -140,11 +156,17 @@ async fn run_gateway_tool_loop(
         accumulate_usage(&mut combined_usage, compaction_usage);
         let output_offset = combined_output.len();
         let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
+            let round_commit_gate = if round == 0 {
+                initial_commit_gate.take()
+            } else {
+                None
+            };
             let stream_payload = fetch_stream_payload(
                 &ctx,
                 exec_ctx,
                 auth,
                 &registry,
+                round_commit_gate,
                 stream
                     .as_mut()
                     .map(|(accumulator, sender)| (&mut **accumulator, *sender)),
@@ -404,7 +426,7 @@ async fn run_blocking(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
 ) -> ExecutorResult<ResponsePayload> {
-    let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None).await?;
+    let (payload, ctx) = run_until_gateway_tools_complete(ctx, exec_ctx, auth, false, None, None).await?;
 
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
@@ -413,25 +435,12 @@ async fn run_blocking(
     Ok(payload)
 }
 
-fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option<String>) -> BoxStream {
+fn stream_from_worker(
+    mut run_handle: AbortOnDrop<StreamRunResult>,
+    mut event_rx: mpsc::UnboundedReceiver<StreamEvent>,
+    exec_ctx: Arc<ExecutionContext>,
+) -> BoxStream {
     Box::pin(stream! {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let exec_ctx_for_run = Arc::clone(&exec_ctx);
-        let event_tx_for_run = event_tx.clone();
-        let stream_accumulator = GatewayStreamAccumulator::new();
-        let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
-            let mut stream_accumulator = stream_accumulator;
-            let result = run_until_gateway_tools_complete(
-                ctx,
-                exec_ctx_for_run.as_ref(),
-                auth.as_deref(),
-                true,
-                Some((&mut stream_accumulator, &event_tx_for_run)),
-            )
-            .await;
-            (result, stream_accumulator)
-        }));
-
         let mut next_sequence_number = 0;
         loop {
             tokio::select! {
@@ -479,6 +488,57 @@ fn run_stream(ctx: RequestContext, exec_ctx: Arc<ExecutionContext>, auth: Option
             }
         }
     })
+}
+
+fn precommit_stream_result(
+    result: Result<StreamRunResult, tokio::task::JoinError>,
+) -> ExecutorResult<BoxStream> {
+    match result {
+        Ok((Err(error), _)) => Err(error),
+        Err(error) => Err(ExecutorError::StreamError(format!(
+            "stream task failed before response commit: {error}"
+        ))),
+        Ok((Ok(_), _)) => Err(ExecutorError::StreamError(
+            "stream completed before initial response commit readiness".to_owned(),
+        )),
+    }
+}
+
+async fn prepare_stream(
+    ctx: RequestContext,
+    exec_ctx: Arc<ExecutionContext>,
+    auth: Option<String>,
+) -> ExecutorResult<BoxStream> {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (mut initial_commit_gate, mut commit_waiter) = initial_stream_commit_gate();
+    let exec_ctx_for_run = Arc::clone(&exec_ctx);
+    let event_tx_for_run = event_tx.clone();
+    let stream_accumulator = GatewayStreamAccumulator::new();
+    let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
+        let mut stream_accumulator = stream_accumulator;
+        let result = run_until_gateway_tools_complete(
+            ctx,
+            exec_ctx_for_run.as_ref(),
+            auth.as_deref(),
+            true,
+            Some(&mut initial_commit_gate),
+            Some((&mut stream_accumulator, &event_tx_for_run)),
+        )
+        .await;
+        (result, stream_accumulator)
+    }));
+
+    tokio::select! {
+        ready = commit_waiter.wait_ready() => {
+            if ready.is_err() {
+                let result = (&mut run_handle.handle).await;
+                return precommit_stream_result(result);
+            }
+            commit_waiter.release()?;
+            Ok(stream_from_worker(run_handle, event_rx, exec_ctx))
+        }
+        result = &mut run_handle.handle => precommit_stream_result(result),
+    }
 }
 
 fn consume_stream_event(event: StreamEvent, next_sequence_number: &mut u64) -> String {
@@ -550,8 +610,12 @@ impl ExecuteRequest {
     /// `Either::Right(BoxStream)` for streaming, where each yielded `String` is
     /// a complete SSE frame ready to forward to the client.
     ///
+    /// Streaming requests are not returned to the caller until the initial
+    /// upstream request has been accepted with a successful HTTP status.
+    ///
     /// # Errors
-    /// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+    /// Returns [`ExecutorError`] if rehydration, initial streaming setup, or
+    /// non-streaming LLM inference fails.
     pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
         debug!(
             model = %self.payload.model,
@@ -564,7 +628,9 @@ impl ExecuteRequest {
         );
         let ctx = rehydrate_conversation(self.payload, &self.exec_ctx).await?;
         if ctx.original_request.stream {
-            Ok(Either::Right(run_stream(ctx, self.exec_ctx, self.client_auth)))
+            Ok(Either::Right(
+                prepare_stream(ctx, self.exec_ctx, self.client_auth).await?,
+            ))
         } else {
             Ok(Either::Left(
                 run_blocking(ctx, &self.exec_ctx, self.client_auth.as_deref()).await?,
@@ -653,6 +719,91 @@ mod tests {
             format!("http://{address}"),
         );
         (exec_ctx, server)
+    }
+
+    async fn streaming_execution_context(
+        app: axum::Router,
+    ) -> (ExecutionContext, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock streaming server");
+        let address = listener.local_addr().expect("mock server address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            format!("http://{address}"),
+        );
+        (exec_ctx, server)
+    }
+
+    fn streaming_payload() -> RequestPayload {
+        serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "store": false,
+            "input": "hello"
+        }))
+        .expect("valid streaming request")
+    }
+
+    #[tokio::test]
+    async fn initial_upstream_non_success_is_returned_before_box_stream() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async { (axum::http::StatusCode::TOO_MANY_REQUESTS, "busy") }),
+        );
+        let (exec_ctx, server) = streaming_execution_context(app).await;
+
+        let result = ExecuteRequest::new(streaming_payload(), Arc::new(exec_ctx)).run().await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("initial upstream 429 must fail before returning a stream"),
+        };
+        assert_eq!(error.http_status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        match error {
+            ExecutorError::LLMRequest { status, body, .. } => {
+                assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(body, "busy");
+            }
+            other => panic!("expected LLMRequest, got {other}"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_upstream_headers_release_stream_before_first_body_chunk() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async {
+                let body_stream = futures::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from_static(
+                        b"data: [DONE]\n\n",
+                    ))
+                });
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from_stream(body_stream))
+                    .expect("valid mock stream response")
+            }),
+        );
+        let (exec_ctx, server) = streaming_execution_context(app).await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            ExecuteRequest::new(streaming_payload(), Arc::new(exec_ctx)).run(),
+        )
+        .await
+        .expect("stream setup should complete after upstream headers, not first body chunk")
+        .expect("initial upstream response succeeds");
+        assert!(matches!(result, Either::Right(_)));
+        drop(result);
+        server.abort();
     }
 
     #[tokio::test]
