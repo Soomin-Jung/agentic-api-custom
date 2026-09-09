@@ -16,6 +16,7 @@ pub mod request;
 
 mod gateway;
 pub mod gateway_accumulator;
+mod stream_commit;
 mod upstream;
 
 pub use compaction::compact_response;
