@@ -207,9 +207,6 @@ async fn run_gateway_tool_loop(
         combined_output.extend(public_output);
 
         match classify_round(has_client_owned, &gateway_results, round, MAX_GATEWAY_TOOL_ROUNDS) {
-            // Client-owned calls (plain function or Codex namespace tools) are
-            // handed back to the caller. Gateway calls in the same turn are
-            // still recorded so the returned conversation is complete.
             LoopDecision::RequiresClientAction => {
                 append_gateway_calls_to_new_input(&mut ctx, &current_output, &registry);
                 append_tool_outputs(
@@ -219,16 +216,10 @@ async fn run_gateway_tool_loop(
                 finalize_loop(&mut payload, combined_output, combined_usage, &ctx);
                 return Ok((payload, ctx));
             }
-            // No gateway work remains — this turn is the final response.
             LoopDecision::Done => {
                 finalize_loop(&mut payload, combined_output, combined_usage, &ctx);
                 return Ok((payload, ctx));
             }
-            // Budget exhausted while the model was still requesting gateway
-            // tools: surface the accumulated work as a partial
-            // `status: "incomplete"` response instead of failing the request.
-            // The final round's gateway calls and outputs are recorded so a
-            // continuation is not fed a dangling tool call.
             LoopDecision::Incomplete(reason) => {
                 append_gateway_calls_to_new_input(&mut ctx, &current_output, &registry);
                 append_tool_outputs(
@@ -240,7 +231,6 @@ async fn run_gateway_tool_loop(
                 payload.incomplete_details = Some(IncompleteDetails { reason: Some(reason) });
                 return Ok((payload, ctx));
             }
-            // Gateway tools ran and rounds remain; feed outputs back and loop.
             LoopDecision::Continue => {
                 ctx.enriched_request.tool_choice = Some(ToolChoice::Auto);
                 append_output_items_to_input(&mut ctx.enriched_request.input, &current_output);
@@ -256,11 +246,6 @@ async fn run_gateway_tool_loop(
     unreachable!("the final round returns Done, RequiresClientAction, or Incomplete");
 }
 
-/// Codex CLI remote-compaction V2: the client appends a `compaction_trigger`
-/// item to the input and expects the server to run its own summarization turn
-/// and stream back exactly one `compaction` output item plus `response.completed`.
-/// The trigger never reaches the upstream model; the summary inference is a
-/// normal blocking call against the same backend as standalone compaction.
 async fn run_compaction_trigger(
     mut ctx: RequestContext,
     exec_ctx: &ExecutionContext,
@@ -407,9 +392,6 @@ async fn execute_and_emit_ordered_output_calls(
     Ok(gateway_results)
 }
 
-/// Move accumulated output/usage onto the terminating round's payload and
-/// inject the response/conversation IDs. The payload's `model`/`created_at`/
-/// `status` from the latest inference turn are preserved.
 fn finalize_loop(
     payload: &mut ResponsePayload,
     combined_output: Vec<crate::types::io::OutputItem>,
@@ -465,10 +447,6 @@ fn stream_from_worker(
                             while let Ok(event) = event_rx.try_recv() {
                                 yield consume_stream_event(event, &mut next_sequence_number);
                             }
-                            // Codex may close its WebSocket as soon as it receives
-                            // `response.completed`. Persist before exposing that
-                            // event so a custom call/output continuation cannot be
-                            // cancelled by the client disconnect.
                             let ch = exec_ctx.conv_handler.clone();
                             let rh = exec_ctx.resp_handler.clone();
                             let mut terminal_accumulator = stream_accumulator.clone();
@@ -564,23 +542,10 @@ fn panicked_stream_chunks(
     chunks
 }
 
-/// Create a new conversation and return its data.
-///
-/// Exposes the conversation-creation step as a standalone function so callers
-/// (e.g. `agentic-server`, Praxis filters, or tests) can pre-create a
-/// conversation before submitting response turns.
-///
-/// # Errors
-/// Returns [`ExecutorError`] if the conversation store is unavailable.
 pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<crate::ConversationData> {
     exec_ctx.conv_handler.create().await
 }
 
-/// Builder for a stateful conversation turn.
-///
-/// ```ignore
-/// ExecuteRequest::new(payload, exec_ctx).with_auth(token).run().await
-/// ```
 pub struct ExecuteRequest {
     payload: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,
@@ -597,25 +562,12 @@ impl ExecuteRequest {
         }
     }
 
-    /// Override the bearer token for this request only; does not touch the shared [`ExecutionContext`].
     #[must_use]
     pub fn with_auth(mut self, token: Option<String>) -> Self {
         self.client_auth = token;
         self
     }
 
-    /// Execute one stateful conversation turn.
-    ///
-    /// Returns `Either::Left(ResponsePayload)` for non-streaming requests, or
-    /// `Either::Right(BoxStream)` for streaming, where each yielded `String` is
-    /// a complete SSE frame ready to forward to the client.
-    ///
-    /// Streaming requests are not returned to the caller until the initial
-    /// upstream request has been accepted with a successful HTTP status.
-    ///
-    /// # Errors
-    /// Returns [`ExecutorError`] if rehydration, initial streaming setup, or
-    /// non-streaming LLM inference fails.
     pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
         debug!(
             model = %self.payload.model,
@@ -639,12 +591,6 @@ impl ExecuteRequest {
     }
 }
 
-/// Execute one stateful conversation turn.
-///
-/// Thin shim over [`ExecuteRequest`] for callers that don't need per-request auth override.
-///
-/// # Errors
-/// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
 pub async fn execute(
     request: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,
@@ -751,6 +697,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_streaming_custom_tool_fails_before_box_stream() {
+        let exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://127.0.0.1:1".to_owned(),
+        );
+        let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model": "test-model",
+            "stream": true,
+            "store": false,
+            "input": "hello",
+            "tools": [{
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/"
+                }
+            }]
+        }))
+        .expect("valid request payload");
+
+        let result = ExecuteRequest::new(payload, Arc::new(exec_ctx)).run().await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("invalid custom tool must fail before returning a stream"),
+        };
+        assert_eq!(error.http_status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(error.to_string().contains("unsupported format"));
+    }
+
+    #[tokio::test]
     async fn initial_upstream_non_success_is_returned_before_box_stream() {
         let app = axum::Router::new().route(
             "/v1/responses",
@@ -802,7 +783,6 @@ mod tests {
         .expect("stream setup should complete after upstream headers, not first body chunk")
         .expect("initial upstream response succeeds");
         assert!(matches!(result, Either::Right(_)));
-        drop(result);
         server.abort();
     }
 
@@ -924,7 +904,7 @@ mod tests {
                 .find_map(|line| line.strip_prefix("data: "))
                 .expect("SSE data line");
             let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue; // terminal [DONE] marker
+                continue;
             };
             let event_type = event["type"].as_str().expect("event type");
             event_types.push(event_type.to_owned());
