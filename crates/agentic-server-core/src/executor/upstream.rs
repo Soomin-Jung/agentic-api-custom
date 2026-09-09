@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use futures::StreamExt;
 use serde_json::Value;
 
@@ -11,8 +9,9 @@ use crate::executor::gateway::{
     emit_gateway_completed_events, emit_gateway_start_events, mcp_list_tools_event_plans, public_output_items,
 };
 use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame};
-use crate::executor::inference::{call_inference, fetch_response_json};
+use crate::executor::inference::{fetch_response_json, response_lines, send_request};
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::stream_commit::InitialStreamCommitGate;
 use crate::tool::ToolRegistry;
 use crate::types::request_response::ResponsePayload;
 use crate::utils::common::serialize_to_string;
@@ -60,6 +59,7 @@ pub(super) async fn fetch_stream_payload(
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     registry: &ToolRegistry,
+    initial_commit_gate: Option<&mut InitialStreamCommitGate>,
     mut stream: Option<(
         &mut GatewayStreamAccumulator,
         &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
@@ -69,13 +69,19 @@ pub(super) async fn fetch_stream_payload(
     let url = exec_ctx.responses_url();
     let upstream_request = ctx.enriched_request.to_upstream_request(true)?;
     let upstream_json = serialize_to_string(&upstream_request).map_err(ExecutorError::JsonError)?;
-    let mut line_stream = Box::pin(call_inference(
-        upstream_json,
-        url,
-        Arc::clone(&exec_ctx.client),
-        auth.map(str::to_owned),
-        exec_ctx.streaming_timeout,
-    ));
+
+    // Establish the initial upstream HTTP response eagerly. A non-2xx response or
+    // connect/setup failure is therefore still a request-level error and can be
+    // returned before the downstream caller commits HTTP 200 SSE.
+    let response = send_request(&exec_ctx.client, &url, upstream_json, auth, None).await?;
+    if let Some(gate) = initial_commit_gate {
+        gate.ready_and_wait().await?;
+    }
+
+    // Once the initial upstream status is known to be successful, body processing
+    // belongs to the committed streaming lifecycle. Chunk/network failures from
+    // this point onward remain in-band SSE errors.
+    let mut line_stream = Box::pin(response_lines(response, exec_ctx.streaming_timeout));
     let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
     let mut function_sse = FunctionSseTranslator::new(registry.tool_type_map());
     let mut defer_from_output_index = None;
