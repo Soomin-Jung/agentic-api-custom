@@ -30,12 +30,28 @@ pub fn convert_response(resp: ProxyResponse) -> Response {
 /// Panics if the response builder produces an invalid response (unreachable in practice).
 pub fn executor_error_response(err: ExecutorError) -> Response {
     let status = err.http_status();
-    if !matches!(err, ExecutorError::LLMRequest { .. }) {
+    let upstream_headers = match &err {
+        ExecutorError::LLMRequest { headers, .. } => Some(headers.clone()),
+        _ => None,
+    };
+    if upstream_headers.is_none() {
         warn!("executor error ({status}): {err}");
     }
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
+
+    let mut builder = Response::builder().status(status);
+    if let Some(headers) = &upstream_headers {
+        for (name, value) in headers {
+            builder = builder.header(name, value);
+        }
+    }
+    if upstream_headers
+        .as_ref()
+        .is_none_or(|headers| !headers.contains_key(http::header::CONTENT_TYPE))
+    {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+    }
+
+    builder
         .body(Body::from(err.into_response_body()))
         .expect("valid error response")
 }
@@ -107,4 +123,47 @@ pub(super) fn sse_response_with_headers(stream: BoxStream, mut headers: HeaderMa
     builder
         .body(Body::from_stream(byte_stream))
         .expect("valid SSE response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn llm_request_error_preserves_retry_and_request_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("7"));
+        headers.insert("x-request-id", http::HeaderValue::from_static("req_test"));
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/problem+json"),
+        );
+        let response = executor_error_response(ExecutorError::LLMRequest {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"error":"busy"}"#.to_owned(),
+            headers,
+        });
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get(http::header::RETRY_AFTER).unwrap(), "7");
+        assert_eq!(response.headers().get("x-request-id").unwrap(), "req_test");
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read error response body");
+        assert_eq!(body, Bytes::from_static(br#"{"error":"busy"}"#));
+    }
+
+    #[tokio::test]
+    async fn local_executor_error_keeps_json_envelope_content_type() {
+        let response = executor_error_response(ExecutorError::InvalidRequest("bad input".to_owned()));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
 }
