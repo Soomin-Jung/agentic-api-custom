@@ -18,6 +18,12 @@ use crate::utils::common::serialize_to_string;
 
 const MAX_DEFERRED_STREAM_BYTES: usize = 256 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamFrameDisposition {
+    Continue,
+    Terminal,
+}
+
 struct StreamEmitContext<'a> {
     request: &'a RequestContext,
     registry: &'a ToolRegistry,
@@ -87,54 +93,73 @@ pub(super) async fn fetch_stream_payload(
     let mut defer_from_output_index = None;
     let mut deferred_events = Vec::new();
     let mut deferred_bytes = 0;
+    let mut saw_terminal_response = false;
+
     while let Some(line_result) = line_stream.next().await {
         let line = line_result?;
         if stream.is_none() {
-            if let Some(frame) = acc.process_sse_line(&line) {
-                log_upstream_failure(&frame, &ctx.response_id);
+            let frame = acc.process_sse_line(&line).ok_or_else(malformed_upstream_data_event)?;
+            log_upstream_failure(&frame, &ctx.response_id);
+            if validate_upstream_frame(&frame)? == UpstreamFrameDisposition::Terminal {
+                saw_terminal_response = true;
+                break;
             }
             continue;
         }
-        if let Some(translation) = acc.process_sse_line_with_translator(&line, &mut function_sse)? {
-            let previous_defer_from_output_index = defer_from_output_index;
-            defer_from_output_index = translation.defer_from_output_index.map(u64::from);
-            for frame in &translation.frames {
-                log_upstream_failure(frame, &ctx.response_id);
+
+        let translation = acc
+            .process_sse_line_with_translator(&line, &mut function_sse)?
+            .ok_or_else(malformed_upstream_data_event)?;
+        let previous_defer_from_output_index = defer_from_output_index;
+        defer_from_output_index = translation.defer_from_output_index.map(u64::from);
+        let mut terminal_in_translation = false;
+        for frame in &translation.frames {
+            log_upstream_failure(frame, &ctx.response_id);
+            if validate_upstream_frame(frame)? == UpstreamFrameDisposition::Terminal {
+                terminal_in_translation = true;
             }
-            if let Some((accumulator, sender)) = stream.as_mut() {
-                let mut emit_ctx = StreamEmitContext {
-                    request: ctx,
-                    registry,
-                    sender,
-                    accumulator,
-                    output_offset,
-                };
-                for frame in translation.frames {
-                    if !is_terminal_response_event(frame.event_type) {
-                        let event_type = frame.event_type;
-                        let emitted = emit_or_defer_stream_frame(
-                            frame,
-                            &mut emit_ctx,
-                            defer_from_output_index,
-                            &mut deferred_events,
-                            &mut deferred_bytes,
-                        )?;
-                        if event_type == SSEEventType::ResponseInProgress && emitted {
-                            emit_mcp_discovery_lifecycle(registry, emit_ctx.accumulator, emit_ctx.sender)?;
-                        }
-                    }
-                }
-                if defer_from_output_index != previous_defer_from_output_index {
-                    flush_released_stream_frames(
+        }
+
+        if let Some((accumulator, sender)) = stream.as_mut() {
+            let mut emit_ctx = StreamEmitContext {
+                request: ctx,
+                registry,
+                sender,
+                accumulator,
+                output_offset,
+            };
+            for frame in translation.frames {
+                if !is_terminal_response_event(frame.event_type) {
+                    let event_type = frame.event_type;
+                    let emitted = emit_or_defer_stream_frame(
+                        frame,
                         &mut emit_ctx,
                         defer_from_output_index,
                         &mut deferred_events,
                         &mut deferred_bytes,
                     )?;
+                    if event_type == SSEEventType::ResponseInProgress && emitted {
+                        emit_mcp_discovery_lifecycle(registry, emit_ctx.accumulator, emit_ctx.sender)?;
+                    }
                 }
             }
+            if defer_from_output_index != previous_defer_from_output_index {
+                flush_released_stream_frames(
+                    &mut emit_ctx,
+                    defer_from_output_index,
+                    &mut deferred_events,
+                    &mut deferred_bytes,
+                )?;
+            }
+        }
+
+        if terminal_in_translation {
+            saw_terminal_response = true;
+            break;
         }
     }
+
+    require_terminal_response(saw_terminal_response)?;
     acc.finish_stream();
     let mut payload = acc.finalize(
         &ctx.enriched_request.model,
@@ -146,6 +171,41 @@ pub(super) async fn fetch_stream_payload(
         payload,
         deferred_events,
     })
+}
+
+fn malformed_upstream_data_event() -> ExecutorError {
+    ExecutorError::StreamError("upstream Responses stream contained an invalid data event".to_owned())
+}
+
+fn validate_upstream_frame(frame: &EventFrame) -> ExecutorResult<UpstreamFrameDisposition> {
+    if frame.wire.event_type.as_deref() == Some("error") {
+        let details = frame
+            .wire
+            .rest
+            .get("error")
+            .map(Value::to_string)
+            .unwrap_or_else(|| "unknown upstream error".to_owned());
+        return Err(ExecutorError::StreamError(format!(
+            "upstream Responses stream returned an error event: {details}"
+        )));
+    }
+
+    if is_terminal_response_event(frame.event_type) {
+        Ok(UpstreamFrameDisposition::Terminal)
+    } else {
+        Ok(UpstreamFrameDisposition::Continue)
+    }
+}
+
+fn require_terminal_response(saw_terminal_response: bool) -> ExecutorResult<()> {
+    if saw_terminal_response {
+        Ok(())
+    } else {
+        Err(ExecutorError::StreamError(
+            "upstream Responses stream ended before response.completed, response.failed, or response.incomplete"
+                .to_owned(),
+        ))
+    }
 }
 
 fn log_upstream_failure(frame: &EventFrame, gateway_response_id: &str) {
@@ -304,7 +364,7 @@ fn apply_context_response_ids(wire: &mut WireEvent, ctx: &RequestContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::EventPayload;
+    use crate::events::{EventPayload, normalize_sse_line};
     use crate::types::io::ResponsesInput;
     use crate::types::request_response::RequestPayload;
 
@@ -348,6 +408,43 @@ mod tests {
             payload: EventPayload::None,
             wire,
         }
+    }
+
+    #[test]
+    fn generic_upstream_error_event_is_a_stream_failure() {
+        let frame = normalize_sse_line(
+            r#"data: {"type":"error","error":{"code":"server_error","message":"engine failed"}}"#,
+        )
+        .expect("error event normalizes");
+
+        let error = validate_upstream_frame(&frame).expect_err("generic upstream error must fail the stream");
+        assert!(error.to_string().contains("engine failed"));
+    }
+
+    #[test]
+    fn completed_failed_and_incomplete_are_terminal_events() {
+        for event_type in [
+            SSEEventType::ResponseCompleted,
+            SSEEventType::ResponseFailed,
+            SSEEventType::ResponseIncomplete,
+        ] {
+            let frame = EventFrame {
+                event_type,
+                payload: EventPayload::None,
+                wire: WireEvent::new(<&str>::try_from(event_type).expect("known terminal event")),
+            };
+            assert_eq!(
+                validate_upstream_frame(&frame).expect("terminal event is valid"),
+                UpstreamFrameDisposition::Terminal
+            );
+        }
+    }
+
+    #[test]
+    fn stream_without_terminal_response_is_rejected() {
+        let error = require_terminal_response(false).expect_err("missing terminal response must fail");
+        assert!(error.to_string().contains("ended before response.completed"));
+        assert!(require_terminal_response(true).is_ok());
     }
 
     #[test]
