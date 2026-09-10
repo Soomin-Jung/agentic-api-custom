@@ -4,7 +4,7 @@
 //! and HTTP errors to [`ExecutorError`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use futures::{Stream, StreamExt};
@@ -65,6 +65,17 @@ pub(super) async fn send_request(
     auth: Option<&str>,
     forwarded_headers: Option<&reqwest::header::HeaderMap>,
 ) -> ExecutorResult<reqwest::Response> {
+    let started_at = Instant::now();
+    let body_bytes = body.len();
+    tracing::debug!(
+        target: "agentic_server",
+        phase = "upstream_http_send_started",
+        url,
+        body_bytes = %body_bytes,
+        forwarded_headers = forwarded_headers.is_some(),
+        "sending LLM upstream HTTP request"
+    );
+
     let mut headers = forwarded_headers.cloned().unwrap_or_default();
     headers
         .entry(reqwest::header::CONTENT_TYPE)
@@ -74,18 +85,33 @@ pub(super) async fn send_request(
         req = req.bearer_auth(key);
     }
 
-    let resp = req.send().await.map_err(|e| ExecutorError::LLMTransport {
-        status: if e.is_timeout() {
-            http::StatusCode::GATEWAY_TIMEOUT
-        } else {
-            http::StatusCode::BAD_GATEWAY
-        },
-        message: if e.is_timeout() {
-            "LLM timeout"
-        } else {
-            "LLM unavailable"
-        },
-    })?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            let status = if error.is_timeout() {
+                http::StatusCode::GATEWAY_TIMEOUT
+            } else {
+                http::StatusCode::BAD_GATEWAY
+            };
+            tracing::warn!(
+                target: "agentic_server",
+                phase = "upstream_http_transport_error",
+                url,
+                status = %status,
+                timeout = error.is_timeout(),
+                elapsed_ms = %started_at.elapsed().as_millis(),
+                "LLM upstream request failed before an HTTP response was established"
+            );
+            return Err(ExecutorError::LLMTransport {
+                status,
+                message: if error.is_timeout() {
+                    "LLM timeout"
+                } else {
+                    "LLM unavailable"
+                },
+            });
+        }
+    };
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -95,15 +121,40 @@ pub(super) async fn send_request(
         let body = resp
             .text()
             .await
-            .inspect_err(|e| tracing::debug!("failed to read error response body: {e}"))
+            .inspect_err(|e| {
+                tracing::debug!(
+                    target: "agentic_server",
+                    phase = "upstream_error_body_read_failed",
+                    url,
+                    "failed to read upstream error response body: {e}"
+                );
+            })
             .unwrap_or_default();
+        let status = http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        tracing::warn!(
+            target: "agentic_server",
+            phase = "upstream_http_rejected",
+            url,
+            status = %status,
+            elapsed_ms = %started_at.elapsed().as_millis(),
+            error_body_bytes = %body.len(),
+            "LLM upstream returned a non-success HTTP status"
+        );
         return Err(ExecutorError::LLMRequest {
-            status: http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+            status,
             body,
             headers,
         });
     }
 
+    tracing::debug!(
+        target: "agentic_server",
+        phase = "upstream_http_accepted",
+        url,
+        status = %resp.status(),
+        elapsed_ms = %started_at.elapsed().as_millis(),
+        "LLM upstream accepted request"
+    );
     Ok(resp)
 }
 
@@ -175,15 +226,39 @@ pub(super) fn response_lines(
         loop {
             let chunk = match next_chunk(&mut bytes, chunk_timeout).await {
                 Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => { yield Err(e); return; }
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "agentic_server",
+                        phase = "upstream_stream_eof",
+                        "upstream response body ended"
+                    );
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "agentic_server",
+                        phase = "upstream_stream_read_error",
+                        error_type = e.error_type(),
+                        error_code = e.error_code(),
+                        "failed while reading upstream response body"
+                    );
+                    yield Err(e);
+                    return;
+                }
             };
 
             buf.extend_from_slice(&chunk);
 
             for line in drain_complete_utf8_lines(&mut buf) {
                 match line.as_str() {
-                    "data: [DONE]" => return,
+                    "data: [DONE]" => {
+                        tracing::debug!(
+                            target: "agentic_server",
+                            phase = "upstream_done_marker",
+                            "upstream emitted SSE [DONE] marker"
+                        );
+                        return;
+                    }
                     l if l.starts_with("data: ") => yield Ok(line),
                     _ => {}
                 }

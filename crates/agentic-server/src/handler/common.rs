@@ -30,13 +30,21 @@ pub fn convert_response(resp: ProxyResponse) -> Response {
 /// Panics if the response builder produces an invalid response (unreachable in practice).
 pub fn executor_error_response(err: ExecutorError) -> Response {
     let status = err.http_status();
+    let error_type = err.error_type();
+    let error_code = err.error_code();
     let upstream_headers = match &err {
         ExecutorError::LLMRequest { headers, .. } => Some(headers.clone()),
         _ => None,
     };
-    if upstream_headers.is_none() {
-        warn!("executor error ({status}): {err}");
-    }
+
+    warn!(
+        phase = "request_error_response",
+        status = %status,
+        error_type,
+        error_code,
+        upstream_error = upstream_headers.is_some(),
+        "returning request-level HTTP error before downstream streaming"
+    );
 
     let mut builder = Response::builder().status(status);
     if let Some(headers) = &upstream_headers {
@@ -109,6 +117,10 @@ pub(super) fn sse_response(stream: BoxStream) -> Response {
 }
 
 pub(super) fn sse_response_with_headers(stream: BoxStream, mut headers: HeaderMap) -> Response {
+    tracing::debug!(
+        phase = "downstream_sse_response_created",
+        "building downstream HTTP 200 SSE response after stream readiness"
+    );
     let byte_stream = stream.map(|line| Ok::<Bytes, std::convert::Infallible>(Bytes::from(line)));
     headers.insert(
         http::header::CONTENT_TYPE,
