@@ -41,6 +41,11 @@ impl InitialStreamCommitGate {
         let ready_tx = self.ready_tx.take().ok_or_else(|| {
             ExecutorError::StreamError("initial stream commit gate was signalled more than once".to_owned())
         })?;
+        tracing::debug!(
+            target: "agentic_server",
+            phase = "downstream_commit_ready",
+            "initial upstream response is accepted; downstream SSE is safe to commit"
+        );
         ready_tx.send(()).map_err(|()| {
             ExecutorError::StreamError("initial stream commit waiter closed before readiness".to_owned())
         })?;
@@ -50,7 +55,13 @@ impl InitialStreamCommitGate {
         })?;
         release_rx.await.map_err(|_| {
             ExecutorError::StreamError("initial stream commit waiter closed before release".to_owned())
-        })
+        })?;
+        tracing::debug!(
+            target: "agentic_server",
+            phase = "downstream_commit_released",
+            "downstream caller acknowledged commit readiness; upstream body consumption may continue"
+        );
+        Ok(())
     }
 }
 

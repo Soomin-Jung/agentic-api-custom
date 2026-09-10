@@ -48,10 +48,28 @@ impl GatewayStreamAccumulator {
     pub(crate) fn terminal_response_chunk(&mut self, payload: &ResponsePayload) -> ExecutorResult<String> {
         let mut frame = terminal_response_frame(payload)?;
         self.stamp_event(&mut frame, 0);
+        tracing::debug!(
+            target: "agentic_server",
+            phase = "downstream_terminal_event",
+            response_id = %payload.id,
+            response_status = %payload.status,
+            event_type = ?frame.event_type,
+            sequence_number = ?frame.sequence_number(),
+            output_items = %payload.output.len(),
+            "emitting downstream terminal Responses event"
+        );
         serialize_sse_frame(&frame)
     }
 
     pub(crate) fn executor_error_chunk(&mut self, error: &ExecutorError) -> String {
+        tracing::warn!(
+            target: "agentic_server",
+            phase = "downstream_sse_error",
+            status = %error.http_status(),
+            error_type = error.error_type(),
+            error_code = error.error_code(),
+            "emitting post-commit SSE error"
+        );
         let mut frame = executor_error_frame(error);
         self.stamp_event(&mut frame, 0);
         serialize_sse_frame(&frame)
