@@ -28,6 +28,25 @@ impl NonEmptyToolName {
     }
 }
 
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for NonEmptyToolName {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .schema_type(utoipa::openapi::schema::SchemaType::new(
+                utoipa::openapi::schema::Type::String,
+            ))
+            .min_length(Some(1))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for NonEmptyToolName {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("NonEmptyToolName")
+    }
+}
+
 impl TryFrom<String> for NonEmptyToolName {
     type Error = EmptyToolNameError;
 
@@ -95,6 +114,8 @@ pub enum ResponsesTool {
     FileSearch(FileSearchToolParam),
     #[serde(rename = "code_interpreter")]
     CodeInterpreter(CodeInterpreterToolParam),
+    #[serde(rename = "shell")]
+    Shell(ShellToolParam),
     #[serde(rename = "namespace")]
     Namespace(CodexNamespaceToolParam),
     /// A freeform tool declaration. Unlike a function tool, calls carry raw
@@ -113,6 +134,7 @@ pub enum ResponsesTool {
 /// `name` is a [`NonEmptyToolName`]: serde rejects empty strings at
 /// deserialization time, making the invalid state unrepresentable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FunctionToolParam {
     pub name: NonEmptyToolName,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +156,7 @@ pub struct FunctionToolParam {
 /// but the gateway rejects formatted custom tools before normalization because
 /// it cannot preserve their constrained-decoding semantics upstream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CustomToolParam {
     pub name: NonEmptyToolName,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +172,7 @@ pub struct CustomToolParam {
 
 /// Only client-executed tool search is part of the public gateway contract.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSearchExecution {
     #[default]
@@ -158,6 +182,7 @@ pub enum ToolSearchExecution {
 
 /// Lifecycle status of a public tool-search call or output item.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSearchStatus {
     InProgress,
@@ -168,6 +193,7 @@ pub enum ToolSearchStatus {
 
 /// Parameters for a client-executed tool-search declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ToolSearchToolParam {
     pub execution: ToolSearchExecution,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,6 +204,7 @@ pub struct ToolSearchToolParam {
 
 /// Parameters for a gateway MCP built-in tool declaration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpToolParam {
     pub server_label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +229,7 @@ pub struct McpToolParam {
         skip_deserializing,
         skip_serializing_if = "Vec::is_empty"
     )]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
     pub(crate) discovered_tools: Vec<McpDiscoveredToolParam>,
 }
 
@@ -215,6 +243,7 @@ pub struct McpDiscoveredToolParam {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchContextSize {
     Low,
@@ -233,12 +262,14 @@ impl WebSearchContextSize {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchFilters {
     pub allowed_domains: Option<Vec<String>>,
     pub blocked_domains: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchUserLocation {
     #[serde(rename = "type")]
     pub type_: Option<String>,
@@ -250,6 +281,7 @@ pub struct WebSearchUserLocation {
 
 /// Parameters for a web search tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchToolParam {
     pub search_context_size: Option<WebSearchContextSize>,
     pub filters: Option<WebSearchFilters>,
@@ -258,15 +290,110 @@ pub struct WebSearchToolParam {
 
 /// Parameters for a file search tool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FileSearchToolParam {
     pub vector_store_ids: Option<Vec<String>>,
 }
 
 /// Parameters for a code interpreter tool (no required fields).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CodeInterpreterToolParam {}
 
+/// Parameters for the shell built-in tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ShellToolParam {
+    pub environment: ShellEnvironment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_callers: Option<Vec<String>>,
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+/// Environment in which shell calls are executed.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum ShellEnvironment {
+    Local(LocalShellEnvironment),
+    Unknown(Value),
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for ShellEnvironment {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, SchemaType, Type};
+
+        AllOfBuilder::new()
+            .item(
+                ObjectBuilder::new()
+                    .property(
+                        "type",
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::new(Type::String))
+                            .enum_values(Some(["local"])),
+                    )
+                    .required("type"),
+            )
+            .item(Ref::from_schema_name("LocalShellEnvironment"))
+            .into()
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for ShellEnvironment {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ShellEnvironment")
+    }
+}
+
+impl Serialize for ShellEnvironment {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = match self {
+            Self::Local(environment) => serde_json::to_value(environment).map_err(serde::ser::Error::custom)?,
+            Self::Unknown(value) => return value.serialize(serializer),
+        };
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("shell environment must serialize as an object"))?;
+        object.insert("type".to_owned(), Value::String("local".to_owned()));
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShellEnvironment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        if value.get("type").and_then(Value::as_str) != Some("local") {
+            return Ok(Self::Unknown(value));
+        }
+        value
+            .as_object_mut()
+            .expect("a value with a string type field must be an object")
+            .remove("type");
+        serde_json::from_value(value)
+            .map(Self::Local)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// Caller-provided local environment configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LocalShellEnvironment {
+    #[serde(default, flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CodexNamespaceToolParam {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +414,99 @@ pub enum CodexNamespaceMember {
     Unknown,
 }
 
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for ResponsesTool {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, SchemaType, Type};
+
+        fn tagged(type_value: &str, schema: &str) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+            AllOfBuilder::new()
+                .item(
+                    ObjectBuilder::new()
+                        .property(
+                            "type",
+                            ObjectBuilder::new()
+                                .schema_type(SchemaType::new(Type::String))
+                                .enum_values(Some([type_value])),
+                        )
+                        .required("type"),
+                )
+                .item(Ref::from_schema_name(schema))
+                .into()
+        }
+
+        utoipa::openapi::schema::OneOfBuilder::new()
+            .discriminator(Some(utoipa::openapi::schema::Discriminator::new("type")))
+            .item(tagged("function", "FunctionToolParam"))
+            .item(tagged("tool_search", "ToolSearchToolParam"))
+            .item(tagged("mcp", "McpToolParam"))
+            .item(
+                AllOfBuilder::new()
+                    .item(
+                        ObjectBuilder::new()
+                            .property(
+                                "type",
+                                ObjectBuilder::new()
+                                    .schema_type(SchemaType::new(Type::String))
+                                    .enum_values(Some([
+                                        "web_search_preview",
+                                        "web_search",
+                                        "web_search_preview_2025_03_11",
+                                        "web_search_2025_08_26",
+                                    ])),
+                            )
+                            .required("type"),
+                    )
+                    .item(Ref::from_schema_name("WebSearchToolParam")),
+            )
+            .item(tagged("file_search", "FileSearchToolParam"))
+            .item(tagged("code_interpreter", "CodeInterpreterToolParam"))
+            .item(tagged("shell", "ShellToolParam"))
+            .item(tagged("namespace", "CodexNamespaceToolParam"))
+            .item(tagged("custom", "CustomToolParam"))
+            .into()
+    }
+}
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for ResponsesTool {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ResponsesTool")
+    }
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for CodexNamespaceMember {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, SchemaType, Type};
+
+        utoipa::openapi::schema::OneOfBuilder::new()
+            .discriminator(Some(utoipa::openapi::schema::Discriminator::new("type")))
+            .item(
+                AllOfBuilder::new()
+                    .item(
+                        ObjectBuilder::new()
+                            .property(
+                                "type",
+                                ObjectBuilder::new()
+                                    .schema_type(SchemaType::new(Type::String))
+                                    .enum_values(Some(["function"])),
+                            )
+                            .required("type"),
+                    )
+                    .item(Ref::from_schema_name("FunctionToolParam")),
+            )
+            .into()
+    }
+}
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for CodexNamespaceMember {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("CodexNamespaceMember")
+    }
+}
+
 impl ResponsesTool {
     #[must_use]
     pub fn original_type(&self) -> Option<&str> {
@@ -297,6 +517,7 @@ impl ResponsesTool {
             Self::WebSearch(_) => Some("web_search_preview"),
             Self::FileSearch(_) => Some("file_search"),
             Self::CodeInterpreter(_) => Some("code_interpreter"),
+            Self::Shell(_) => Some("shell"),
             Self::Namespace(_) => Some("namespace"),
             Self::Custom(_) => Some("custom"),
             Self::Unknown => None,
@@ -612,6 +833,50 @@ mod tests {
         let tool: ResponsesTool = serde_json::from_value(json).unwrap();
         assert!(matches!(tool, ResponsesTool::CodeInterpreter(_)));
         assert_eq!(serde_json::to_value(&tool).unwrap()["type"], "code_interpreter");
+    }
+
+    #[test]
+    fn responses_tool_shell_local_environment_round_trips() {
+        let json = serde_json::json!({
+            "type": "shell",
+            "environment": {
+                "type": "local",
+                "skills": [{"name": "repo", "path": "/workspace/repo"}]
+            },
+            "allowed_callers": ["assistant"],
+            "future_tool_field": true
+        });
+        let tool: ResponsesTool = serde_json::from_value(json).unwrap();
+        assert!(matches!(tool, ResponsesTool::Shell(_)));
+
+        let serialized = serde_json::to_value(tool).unwrap();
+        assert_eq!(serialized["type"], "shell");
+        assert_eq!(serialized["environment"]["type"], "local");
+        assert_eq!(serialized["environment"]["skills"][0]["name"], "repo");
+        assert_eq!(serialized["allowed_callers"][0], "assistant");
+        assert_eq!(serialized["future_tool_field"], true);
+    }
+
+    #[test]
+    fn responses_tool_shell_preserves_unknown_environment() {
+        let json = serde_json::json!({
+            "type": "shell",
+            "environment": {
+                "type": "container_reference",
+                "container": "cntr_123",
+                "future_environment_field": true
+            }
+        });
+        let tool: ResponsesTool = serde_json::from_value(json.clone()).unwrap();
+        assert!(matches!(
+            tool,
+            ResponsesTool::Shell(ShellToolParam {
+                environment: ShellEnvironment::Unknown(_),
+                ..
+            })
+        ));
+
+        assert_eq!(serde_json::to_value(tool).unwrap(), json);
     }
 
     #[test]

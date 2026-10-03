@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "baseline": {
+    "crates/agentic-server-core/src/executor/engine.rs": 644,
+    "crates/agentic-server-core/src/executor/gateway.rs": 653,
+    "crates/agentic-server-core/src/executor/messages_stream.rs": 501,
+    "crates/agentic-server-core/src/storage/schema.rs": 552,
+    "crates/agentic-server-core/src/tool/registry.rs": 515,
+    "crates/agentic-server-core/src/tool/tool_search.rs": 1764,
+    "crates/agentic-server-core/src/types/io/output.rs": 932,
+    "crates/agentic-server/src/agentic_process.rs": 552,
+    "crates/agentic-server/src/auth.rs": 799,
+    "crates/agentic-server/src/handler/websocket/responses.rs": 792
+  },
+  "exceptions": {
+    "crates/agentic-server-core/src/executor/accumulator/mod.rs": {
+      "limit": 641,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server-core/src/executor/session.rs": {
+      "limit": 508,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server-core/src/types/io/input.rs": {
+      "limit": 629,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server-core/src/types/io/output.rs": {
+      "limit": 1110,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server-core/src/types/request_response.rs": {
+      "limit": 582,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server-core/src/types/tools/params.rs": {
+      "limit": 537,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server/src/agentic_process.rs": {
+      "limit": 557,
+      "reason": "Bounded baseline import from upstream v0.8.0 (8f5fe27) during the 0.5-era fork upgrade. Preserve the prior main allowance; no custom growth beyond the imported release (accumulator is reduced by extraction)."
+    },
+    "crates/agentic-server/src/handler/websocket/responses.rs": {
+      "limit": 842,
+      "reason": "Bounded import of upstream v0.8.0 (841 production lines) plus one line moving shutdown admission before eager bootstrap; required to drain already-started inference. Preserve the prior main allowance."
+    }
+  },
+  "generated": {}
+}

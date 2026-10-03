@@ -4,9 +4,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ResponseHandler};
+use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ExecutorError, ResponseHandler};
 use agentic_core::storage::{ConversationStore, ResponseStore};
-use agentic_core::tool::{GatewayExecutor, WebSearchHandler};
+use agentic_core::tool::{GatewayExecutor, ToolOutput, WebSearchHandler};
+use agentic_core::types::event::MessageStatus;
+use agentic_core::types::io::output::{FunctionToolCall, WebSearchCallStatus};
 use agentic_core::types::io::{
     FunctionToolResultMessage, InputItem, OutputItem, ResponsesInput, ToolCallOutput, ToolChoice,
 };
@@ -307,7 +309,7 @@ async fn spawn_mock_you_with_response(
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
-                    let body = query_params_as_json(&uri);
+                    let body = support::query_params_as_json(&uri);
                     tx.send(CapturedSearchRequest { api_key, body }).await.unwrap();
                     (status, Json(response_body.clone()))
                 },
@@ -345,7 +347,7 @@ async fn spawn_mock_you_waiting_for_two_searches() -> (
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default()
                         .to_owned();
-                    let body = query_params_as_json(&uri);
+                    let body = support::query_params_as_json(&uri);
                     tx.send(CapturedSearchRequest {
                         api_key,
                         body: body.clone(),
@@ -383,31 +385,6 @@ async fn spawn_mock_you_waiting_for_two_searches() -> (
     let addr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     (format!("http://{addr}"), rx, handle)
-}
-
-fn query_params_as_json(uri: &Uri) -> serde_json::Value {
-    let mut params = serde_json::Map::new();
-    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
-        let value = if let Ok(number) = value.parse::<u64>() {
-            serde_json::Value::from(number)
-        } else {
-            serde_json::Value::String(value.into_owned())
-        };
-        let key = key.into_owned();
-        match params.remove(&key) {
-            None => {
-                params.insert(key, value);
-            }
-            Some(serde_json::Value::Array(mut values)) => {
-                values.push(value);
-                params.insert(key, serde_json::Value::Array(values));
-            }
-            Some(previous) => {
-                params.insert(key, serde_json::Value::Array(vec![previous, value]));
-            }
-        }
-    }
-    serde_json::Value::Object(params)
 }
 
 #[tokio::test]
@@ -460,6 +437,177 @@ async fn web_search_handler_requires_base_url() {
         err.to_string(),
         "invalid tool config: YOU_API_BASE_URL must be set to use the web_search tool"
     );
+}
+
+/// Exact pre-refactor serialization of [`spawn_mock_you`]'s response for the
+/// request below, captured before the typed normalization introduced for
+/// #291. For a response that only carries modeled fields in wire order, the
+/// typed path must reproduce the legacy pass-through output byte-for-byte.
+const MOCK_YOU_TOOL_OUTPUT: &str = concat!(
+    r#"{"query":"rust async","queries":["rust async"],"#,
+    r#""results":{"web":[{"url":"https://example.com/rust","title":"Rust async guide","#,
+    r#""description":"A useful guide","snippets":["Use async carefully."]}],"news":[]},"#,
+    r#""metadata":[{"query":"rust async","search_uuid":"search_123","latency":0.12}]}"#
+);
+
+#[tokio::test]
+async fn web_search_handler_output_is_byte_identical_for_mock_you_response() {
+    let (base_url, _captured, _handle) = spawn_mock_you().await;
+    let handler =
+        WebSearchHandler::with_api_key(Arc::new(reqwest::Client::new()), "secret-you-key".to_owned(), &base_url);
+    let params = WebSearchToolParam::default();
+    let arguments = r#"{"query":"rust async","count":2,"exclude_domains":["example.com","example.org"]}"#;
+
+    let output = handler
+        .execute("call_search", "web_search", arguments, &params)
+        .await
+        .unwrap();
+
+    assert_eq!(output.output, MOCK_YOU_TOOL_OUTPUT);
+
+    let call = FunctionToolCall {
+        id: "fc_search".to_owned(),
+        call_id: "call_search".to_owned(),
+        name: "web_search".to_owned(),
+        namespace: None,
+        arguments: arguments.to_owned(),
+        status: MessageStatus::Completed,
+    };
+    let public = handler
+        .public_output(&call, &output, WebSearchCallStatus::Completed, &params)
+        .expect("web_search_call public output");
+    assert_eq!(
+        serde_json::to_value(&public).unwrap(),
+        serde_json::json!({
+            "id": "ws_search",
+            "type": "web_search_call",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "rust async",
+                "queries": ["rust async"],
+                "sources": [{"url": "https://example.com/rust", "title": "Rust async guide"}]
+            }
+        })
+    );
+}
+
+/// Sanitized live You.com `GET /v1/search` responses, extracted from
+/// `cassettes/messages_multiround/sequential-web-search-qwen3-nonstreaming.yaml`
+/// with `cassettes/extract_you_search_fixture.py`. That cassette was recorded
+/// while the gateway forwarded You.com's `results` and `metadata` verbatim, so
+/// the fixtures carry the provider's real field set: `original_thumbnail_url`
+/// alongside `thumbnail_url` / `favicon_url`, results without `page_age`, and a
+/// response whose `results` has no `news` section at all. Only `search_uuid`
+/// and `latency` were sanitized and the result lists truncated.
+const YOU_SEARCH_RESPONSE_FIXTURE: &str = include_str!("fixtures/you_search_response.json");
+const YOU_SEARCH_RESPONSE_WITHOUT_NEWS_FIXTURE: &str = include_str!("fixtures/you_search_response_without_news.json");
+
+/// Fields You.com returns that the typed normalization deliberately drops.
+const YOU_COSMETIC_FIELDS: [&str; 3] = ["thumbnail_url", "original_thumbnail_url", "favicon_url"];
+
+async fn execute_recorded_you_response(fixture: &serde_json::Value, query: &str) -> (WebSearchHandler, ToolOutput) {
+    let (base_url, _captured, _handle) = spawn_mock_you_with_response(StatusCode::OK, fixture.clone()).await;
+    let handler =
+        WebSearchHandler::with_api_key(Arc::new(reqwest::Client::new()), "secret-you-key".to_owned(), &base_url);
+    let arguments = serde_json::json!({ "query": query }).to_string();
+    let output = handler
+        .execute("call_search", "web_search", &arguments, &WebSearchToolParam::default())
+        .await
+        .unwrap();
+    (handler, output)
+}
+
+#[tokio::test]
+async fn web_search_handler_normalizes_recorded_you_response() {
+    let fixture: serde_json::Value = serde_json::from_str(YOU_SEARCH_RESPONSE_FIXTURE).unwrap();
+    let query = fixture["metadata"]["query"].as_str().unwrap();
+    let (handler, output) = execute_recorded_you_response(&fixture, query).await;
+    let output_json: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+
+    let mut seen_cosmetic_fields = std::collections::BTreeSet::new();
+    for section in ["web", "news"] {
+        let expected = fixture["results"][section].as_array().unwrap();
+        let actual = output_json["results"][section].as_array().unwrap();
+        assert_eq!(actual.len(), expected.len(), "{section} result count");
+        for (expected, actual) in expected.iter().zip(actual) {
+            let expected_object = expected.as_object().unwrap();
+            let actual_object = actual.as_object().unwrap();
+            for (field, value) in expected_object {
+                if YOU_COSMETIC_FIELDS.contains(&field.as_str()) {
+                    seen_cosmetic_fields.insert(field.as_str());
+                    assert!(!actual_object.contains_key(field), "{section}.{field} is cosmetic");
+                } else if value.as_array().is_some_and(Vec::is_empty) {
+                    assert!(
+                        !actual_object.contains_key(field),
+                        "{section}.{field} empty list is elided"
+                    );
+                } else {
+                    assert_eq!(actual_object.get(field), Some(value), "{section}.{field}");
+                }
+            }
+            let unexpected: Vec<&String> = actual_object
+                .keys()
+                .filter(|key| !expected_object.contains_key(*key))
+                .collect();
+            assert!(unexpected.is_empty(), "{section} gained fields {unexpected:?}");
+        }
+    }
+    assert_eq!(
+        seen_cosmetic_fields.into_iter().collect::<Vec<_>>(),
+        ["favicon_url", "original_thumbnail_url", "thumbnail_url"],
+        "recorded fixture must exercise every cosmetic field"
+    );
+    assert_eq!(output_json["metadata"], serde_json::json!([fixture["metadata"]]));
+
+    let call = FunctionToolCall {
+        id: "fc_search".to_owned(),
+        call_id: "call_search".to_owned(),
+        name: "web_search".to_owned(),
+        namespace: None,
+        arguments: serde_json::json!({ "query": query }).to_string(),
+        status: MessageStatus::Completed,
+    };
+    let public = handler
+        .public_output(
+            &call,
+            &output,
+            WebSearchCallStatus::Completed,
+            &WebSearchToolParam::default(),
+        )
+        .expect("web_search_call public output");
+    let public = serde_json::to_value(&public).unwrap();
+    let expected_sources: Vec<serde_json::Value> = ["web", "news"]
+        .into_iter()
+        .flat_map(|section| fixture["results"][section].as_array().unwrap().iter())
+        .map(|result| serde_json::json!({"url": result["url"], "title": result["title"]}))
+        .collect();
+    assert_eq!(public["action"]["sources"], serde_json::Value::Array(expected_sources));
+}
+
+#[tokio::test]
+async fn web_search_handler_tolerates_recorded_you_response_without_news() {
+    let fixture: serde_json::Value = serde_json::from_str(YOU_SEARCH_RESPONSE_WITHOUT_NEWS_FIXTURE).unwrap();
+    assert!(
+        fixture["results"].get("news").is_none(),
+        "fixture must lack a news section"
+    );
+    let query = fixture["metadata"]["query"].as_str().unwrap();
+    let (_handler, output) = execute_recorded_you_response(&fixture, query).await;
+    let output_json: serde_json::Value = serde_json::from_str(&output.output).unwrap();
+
+    assert_eq!(output_json["results"]["news"], serde_json::json!([]));
+    let expected_web = fixture["results"]["web"].as_array().unwrap();
+    let actual_web = output_json["results"]["web"].as_array().unwrap();
+    assert_eq!(actual_web.len(), expected_web.len());
+    for (expected, actual) in expected_web.iter().zip(actual_web) {
+        assert_eq!(actual["url"], expected["url"]);
+        assert_eq!(actual["title"], expected["title"]);
+        assert_eq!(actual["snippets"], expected["snippets"]);
+        assert_eq!(actual.get("page_age"), expected.get("page_age"));
+        assert!(actual.get("favicon_url").is_none());
+    }
+    assert_eq!(output_json["metadata"], serde_json::json!([fixture["metadata"]]));
 }
 
 fn web_search_function_call_response() -> support::MockResponse {
@@ -2017,7 +2165,84 @@ async fn execute_runs_large_gateway_fanout_without_hard_cap() {
 }
 
 #[tokio::test]
-async fn stream_error_events_escape_error_messages() {
+async fn stream_error_stops_before_later_events_without_executing_tools() {
+    let (you_url, mut captured_you, _you_handle) = spawn_mock_you().await;
+    let call = serde_json::json!({
+        "type": "function_call", "id": "fc_search", "call_id": "call_search",
+        "name": "web_search", "arguments": "{\"query\":\"rust async\"}", "status": "completed"
+    });
+    let diagnostic = serde_json::json!({
+        "type": "error", "code": "provider_specific", "message": "unique upstream diagnostic",
+        "param": "upstream_field"
+    });
+    let llm = support::MockServer::start_deque(vec![sse_response([
+        serde_json::json!({
+            "type": "response.created", "response": {"id": "resp_failed", "status": "in_progress"}
+        }),
+        serde_json::json!({
+            "type": "response.in_progress", "response": {"id": "resp_failed", "status": "in_progress"}
+        }),
+        serde_json::json!({
+            "type": "response.output_item.added", "output_index": 0,
+            "item": {
+                "type": "function_call", "id": "fc_search", "call_id": "call_search",
+                "name": "web_search", "arguments": "", "status": "in_progress"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_search",
+            "name": "web_search", "arguments": "{\"query\":\"rust async\"}"
+        }),
+        serde_json::json!({"type": "response.output_item.done", "output_index": 0, "item": call}),
+        diagnostic.clone(),
+        serde_json::json!({
+            "type": "provider.gateway_metadata", "output_index": 0, "metadata": {"trace_id": "trace_failed"}
+        }),
+        serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed", "status": "failed", "output": [call],
+                "error": {"code": "server_error", "message": "generic failure"}
+            }
+        }),
+    ])])
+    .await;
+    let exec_ctx = build_exec_ctx(llm.url(), you_url).await;
+    let payload: RequestPayload = serde_json::from_value(serde_json::json!({
+        "model": "test-model", "input": "search", "stream": true, "store": false,
+        "tools": [{"type": "web_search_preview"}]
+    }))
+    .unwrap();
+
+    let Either::Right(stream) = ExecuteRequest::new(payload, exec_ctx).run().await.unwrap() else {
+        panic!("expected streaming response");
+    };
+    let chunks: Vec<String> = stream.collect().await;
+    let events = streamed_sse_events(&chunks);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["response.created", "response.in_progress", "error"]
+    );
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event["sequence_number"].as_u64(), Some(u64::try_from(index).unwrap()));
+    }
+    assert!(
+        events[2]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unique upstream diagnostic")
+    );
+    assert!(
+        captured_you.try_recv().is_err(),
+        "failed rounds must not execute gateway tools"
+    );
+}
+
+#[tokio::test]
+async fn initial_stream_error_preserves_quoted_upstream_body() {
     let app = Router::new().route(
         "/v1/responses",
         post(|| async {
@@ -2066,17 +2291,12 @@ async fn stream_error_events_escape_error_messages() {
         context_management: None,
     };
 
-    let result = ExecuteRequest::new(payload, exec_ctx).run().await.unwrap();
-    let Either::Right(stream) = result else {
-        panic!("expected streaming response");
+    let Err(ExecutorError::LLMRequest { status, body, .. }) = ExecuteRequest::new(payload, exec_ctx).run().await else {
+        panic!("expected upstream HTTP failure before exposing a stream");
     };
-    let chunks: Vec<String> = stream.collect().await;
-    let parsed = streamed_sse_events(&chunks)
-        .into_iter()
-        .find(|event| event["type"] == "error")
-        .expect("stream should include error event");
-    let error = parsed["error"]["message"].as_str().unwrap();
-    assert!(error.contains(r#"bad \"quoted\" upstream response"#), "{error}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"], "bad \"quoted\" upstream response");
 }
 
 fn web_search_function_call_response_with_id(call_id: &str) -> support::MockResponse {

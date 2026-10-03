@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::types::io::{OutputItem, ResponseUsage};
+use crate::types::io::{OutputItem, ResponseUsage, ShellCall};
 
 /// The type of an output item received during streaming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub enum SSEItemType {
     WebSearchCall,
     McpCall,
     McpListTools,
+    ShellCall,
     Compaction,
     Message,
 }
@@ -28,6 +29,7 @@ impl SSEItemType {
             Self::WebSearchCall => "web_search_call",
             Self::McpCall => "mcp_call",
             Self::McpListTools => "mcp_list_tools",
+            Self::ShellCall => "shell_call",
             Self::Compaction => "compaction",
             Self::Message => "message",
         }
@@ -52,6 +54,7 @@ impl std::str::FromStr for SSEItemType {
             "web_search_call" => Ok(Self::WebSearchCall),
             "mcp_call" => Ok(Self::McpCall),
             "mcp_list_tools" => Ok(Self::McpListTools),
+            "shell_call" => Ok(Self::ShellCall),
             "compaction" => Ok(Self::Compaction),
             "message" => Ok(Self::Message),
             _ => Err(()),
@@ -71,6 +74,7 @@ impl TryFrom<&OutputItem> for SSEItemType {
             OutputItem::WebSearchCall(_) => Ok(Self::WebSearchCall),
             OutputItem::McpCall(_) => Ok(Self::McpCall),
             OutputItem::McpListTools(_) => Ok(Self::McpListTools),
+            OutputItem::ShellCall(_) => Ok(Self::ShellCall),
             OutputItem::Reasoning(_) => Ok(Self::Reasoning),
             OutputItem::Compaction(_) => Ok(Self::Compaction),
             OutputItem::Unknown => Err(()),
@@ -125,6 +129,9 @@ pub enum SSEEventType {
     FunctionCallArgumentsDone,
     CustomToolCallInputDelta,
     CustomToolCallInputDone,
+    ShellCallCommandAdded,
+    ShellCallCommandDelta,
+    ShellCallCommandDone,
 
     // Reasoning
     ReasoningTextDelta,
@@ -171,6 +178,9 @@ impl From<&str> for SSEEventType {
             "response.function_call_arguments.done" => Self::FunctionCallArgumentsDone,
             "response.custom_tool_call_input.delta" => Self::CustomToolCallInputDelta,
             "response.custom_tool_call_input.done" => Self::CustomToolCallInputDone,
+            "response.shell_call_command.added" => Self::ShellCallCommandAdded,
+            "response.shell_call_command.delta" => Self::ShellCallCommandDelta,
+            "response.shell_call_command.done" => Self::ShellCallCommandDone,
             "response.reasoning_text.delta" => Self::ReasoningTextDelta,
             "response.reasoning_text.done" => Self::ReasoningTextDone,
             "response.reasoning_part.added" => Self::ReasoningPartAdded,
@@ -215,6 +225,9 @@ impl TryFrom<SSEEventType> for &'static str {
             SSEEventType::FunctionCallArgumentsDone => Ok("response.function_call_arguments.done"),
             SSEEventType::CustomToolCallInputDelta => Ok("response.custom_tool_call_input.delta"),
             SSEEventType::CustomToolCallInputDone => Ok("response.custom_tool_call_input.done"),
+            SSEEventType::ShellCallCommandAdded => Ok("response.shell_call_command.added"),
+            SSEEventType::ShellCallCommandDelta => Ok("response.shell_call_command.delta"),
+            SSEEventType::ShellCallCommandDone => Ok("response.shell_call_command.done"),
             SSEEventType::ReasoningTextDelta => Ok("response.reasoning_text.delta"),
             SSEEventType::ReasoningTextDone => Ok("response.reasoning_text.done"),
             SSEEventType::ReasoningPartAdded => Ok("response.reasoning_part.added"),
@@ -243,12 +256,25 @@ impl TryFrom<SSEEventType> for &'static str {
 pub struct WireEvent {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sequence_number",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sequence_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<u64>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
+}
+
+// Some upstreams use negative integer sentinels for an unspecified sequence.
+// Preserve the full u64 range; client numbering belongs to the stream relay.
+fn deserialize_sequence_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i128>::deserialize(deserializer).map(|value| value.and_then(|number| u64::try_from(number).ok()))
 }
 
 impl WireEvent {
@@ -261,6 +287,14 @@ impl WireEvent {
             rest: Map::new(),
         }
     }
+}
+
+/// One command's incremental lifecycle within a shell output item.
+#[derive(Debug, Clone)]
+pub enum ShellCommandUpdate {
+    Added(String),
+    Delta(String),
+    Done(String),
 }
 
 /// Typed payload extracted from an SSE event's JSON data.
@@ -279,17 +313,19 @@ pub enum EventPayload {
     OutputItemAdded {
         item_id: String,
         item_type: SSEItemType,
-        output_index: u32,
+        output_index: Option<u32>,
         name: Option<String>,
         namespace: Option<String>,
         call_id: Option<String>,
+        /// Preserve the typed initial shell item before command events arrive.
+        shell_call: Option<Box<ShellCall>>,
     },
 
     /// `response.output_item.done`
     OutputItemDone {
         item_id: String,
         item_type: SSEItemType,
-        output_index: u32,
+        output_index: Option<u32>,
         item: Value,
     },
 
@@ -297,7 +333,7 @@ pub enum EventPayload {
     TextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -305,7 +341,8 @@ pub enum EventPayload {
     TextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
+        content_index: u32,
     },
 
     /// `response.function_call_arguments.delta`
@@ -313,7 +350,7 @@ pub enum EventPayload {
         delta: String,
         call_id: Option<String>,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.function_call_arguments.done`
@@ -322,28 +359,34 @@ pub enum EventPayload {
         call_id: Option<String>,
         item_id: String,
         name: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.custom_tool_call_input.delta`
+    ShellCallCommand {
+        item_id: String,
+        output_index: u32,
+        command_index: u32,
+        update: ShellCommandUpdate,
+    },
     CustomToolCallInputDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.custom_tool_call_input.done`
     CustomToolCallInputDone {
         input: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.reasoning_text.delta`
     ReasoningTextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -351,7 +394,7 @@ pub enum EventPayload {
     ReasoningTextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -359,7 +402,7 @@ pub enum EventPayload {
     ReasoningSummaryTextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         summary_index: u32,
     },
 
@@ -367,7 +410,7 @@ pub enum EventPayload {
     ReasoningSummaryTextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         summary_index: u32,
     },
 
@@ -389,6 +432,50 @@ pub struct EventFrame {
 }
 
 impl EventFrame {
+    /// The supplied item index, retaining absence until ingestion resolves it.
+    pub(crate) fn output_index(&self) -> Option<u32> {
+        match &self.payload {
+            EventPayload::OutputItemAdded { output_index, .. }
+            | EventPayload::OutputItemDone { output_index, .. }
+            | EventPayload::TextDelta { output_index, .. }
+            | EventPayload::TextDone { output_index, .. }
+            | EventPayload::FunctionCallArgsDelta { output_index, .. }
+            | EventPayload::FunctionCallArgsDone { output_index, .. }
+            | EventPayload::CustomToolCallInputDelta { output_index, .. }
+            | EventPayload::CustomToolCallInputDone { output_index, .. }
+            | EventPayload::ReasoningTextDelta { output_index, .. }
+            | EventPayload::ReasoningTextDone { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDelta { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDone { output_index, .. } => *output_index,
+            _ => self.wire.output_index.and_then(|index| u32::try_from(index).ok()),
+        }
+    }
+
+    /// Carries the ingestion-resolved index into folding and emitted wire data.
+    pub(crate) fn set_output_index(&mut self, index: u32) {
+        self.wire.output_index = Some(u64::from(index));
+        match &mut self.payload {
+            EventPayload::OutputItemAdded { output_index, .. }
+            | EventPayload::OutputItemDone { output_index, .. }
+            | EventPayload::TextDelta { output_index, .. }
+            | EventPayload::TextDone { output_index, .. }
+            | EventPayload::FunctionCallArgsDelta { output_index, .. }
+            | EventPayload::FunctionCallArgsDone { output_index, .. }
+            | EventPayload::CustomToolCallInputDelta { output_index, .. }
+            | EventPayload::CustomToolCallInputDone { output_index, .. }
+            | EventPayload::ReasoningTextDelta { output_index, .. }
+            | EventPayload::ReasoningTextDone { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDelta { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDone { output_index, .. } => *output_index = Some(index),
+            EventPayload::Raw(value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("output_index".to_owned(), Value::from(index));
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[must_use]
     pub fn synthetic(event_type: SSEEventType, rest: Map<String, Value>) -> Option<Self> {
         let event_type_name = <&str>::try_from(event_type).ok()?;
@@ -455,6 +542,9 @@ mod tests {
             SSEEventType::FunctionCallArgumentsDone,
             SSEEventType::CustomToolCallInputDelta,
             SSEEventType::CustomToolCallInputDone,
+            SSEEventType::ShellCallCommandAdded,
+            SSEEventType::ShellCallCommandDelta,
+            SSEEventType::ShellCallCommandDone,
             SSEEventType::ReasoningTextDelta,
             SSEEventType::ReasoningTextDone,
             SSEEventType::ReasoningPartAdded,

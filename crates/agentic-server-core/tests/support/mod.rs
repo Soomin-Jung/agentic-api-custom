@@ -100,14 +100,18 @@ pub fn responses_turns(cassette: &Cassette) -> Vec<&Turn> {
 
 /// Extract the expected output text from a cassette turn.
 ///
-/// - Non-streaming: `body.output[0].content[0].text`
+/// - Non-streaming: concatenate message output text, excluding reasoning items.
 /// - Streaming: concatenate all `response.output_text.delta` values
 pub fn expected_text(turn: &Turn) -> String {
     if let Some(body) = &turn.response.body {
-        return body["output"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        return body["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "message")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter_map(|part| part["text"].as_str())
+            .collect();
     }
     if let Some(sse) = &turn.response.sse {
         let mut out = String::new();
@@ -553,6 +557,7 @@ pub fn output_text(payload: &ResponsePayload) -> String {
             OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
+            | OutputItem::ShellCall(_)
             | OutputItem::WebSearchCall(_)
             | OutputItem::McpCall(_)
             | OutputItem::McpListTools(_)
@@ -561,4 +566,31 @@ pub fn output_text(payload: &ResponsePayload) -> String {
             | OutputItem::Unknown => None,
         })
         .collect::<String>()
+}
+
+/// Decodes a request's query string into a JSON object; numeric values become
+/// numbers and repeated keys become arrays, so tests can assert on it directly.
+pub fn query_params_as_json(uri: &axum::http::Uri) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        let value = if let Ok(number) = value.parse::<u64>() {
+            serde_json::Value::from(number)
+        } else {
+            serde_json::Value::String(value.into_owned())
+        };
+        let key = key.into_owned();
+        match params.remove(&key) {
+            None => {
+                params.insert(key, value);
+            }
+            Some(serde_json::Value::Array(mut values)) => {
+                values.push(value);
+                params.insert(key, serde_json::Value::Array(values));
+            }
+            Some(previous) => {
+                params.insert(key, serde_json::Value::Array(vec![previous, value]));
+            }
+        }
+    }
+    serde_json::Value::Object(params)
 }

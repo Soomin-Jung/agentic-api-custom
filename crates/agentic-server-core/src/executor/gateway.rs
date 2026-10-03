@@ -9,7 +9,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::config::DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS;
 use crate::events::SSEEventType;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame, synthetic_event};
+use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, synthetic_event};
+use crate::executor::pipeline::emit_gateway_event;
 use crate::executor::request::RequestContext;
 use crate::executor::response_budget::ExecutorResponseBudget;
 use crate::tool::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
@@ -363,20 +364,27 @@ pub(super) fn public_output_items(
     output_items: &[OutputItem],
     registry: &ToolRegistry,
     gateway_results: &[GatewayCallResult],
-) -> Vec<OutputItem> {
+) -> ExecutorResult<Vec<OutputItem>> {
     output_items
         .iter()
         .enumerate()
-        .map(|(item_index, item)| match item {
-            OutputItem::FunctionCall(call) if registry.is_client_custom_name(&call.name) => {
-                crate::tool::CustomHandler::output_item(call)
-            }
-            OutputItem::FunctionCall(call) if registry.is_gateway_owned_name(&call.name) => gateway_results
-                .iter()
-                .find(|result| result.item_index == item_index)
-                .and_then(|result| result.public_output.clone())
-                .unwrap_or_else(|| OutputItem::FunctionCall(call.clone())),
-            other => other.clone(),
+        .map(|(item_index, item)| {
+            Ok(match item {
+                OutputItem::FunctionCall(call) if registry.is_client_custom_name(&call.name) => {
+                    crate::tool::CustomHandler::output_item(call)
+                }
+                OutputItem::FunctionCall(call) if registry.is_client_shell_name(&call.name) => {
+                    crate::tool::ShellHandler::output_item(call).ok_or_else(|| {
+                        ExecutorError::ParseError("shell function call contains invalid action arguments".to_owned())
+                    })?
+                }
+                OutputItem::FunctionCall(call) if registry.is_gateway_owned_name(&call.name) => gateway_results
+                    .iter()
+                    .find(|result| result.item_index == item_index)
+                    .and_then(|result| result.public_output.clone())
+                    .unwrap_or_else(|| OutputItem::FunctionCall(call.clone())),
+                other => other.clone(),
+            })
         })
         .collect()
 }
@@ -527,6 +535,7 @@ pub(super) async fn emit_gateway_start_events<'a>(
             | OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
+            | OutputItem::ShellCall(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
             | OutputItem::Unknown => {}
@@ -570,7 +579,7 @@ pub(super) async fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSour
                 },
                 list_tools.id.as_str(),
             )),
-            OutputItem::Compaction(_) => None,
+            OutputItem::Compaction(_) | OutputItem::ShellCall(_) => None,
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
@@ -625,17 +634,6 @@ pub(super) async fn execute_and_emit_output_calls(
         .await?;
     }
     Ok(gateway_results)
-}
-
-async fn emit_gateway_event(
-    frame: &mut crate::events::EventFrame,
-    stream_accumulator: &mut GatewayStreamAccumulator,
-    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
-) -> ExecutorResult<()> {
-    if stream_accumulator.process_event(frame, 0) {
-        emit_sse_frame(stream_sender, frame).await?;
-    }
-    Ok(())
 }
 
 pub(super) fn append_input_item(input: &mut ResponsesInput, item: InputItem) {
@@ -1068,9 +1066,7 @@ mod tests {
         let web_search: ResponsesTool =
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
-        executors.insert(Arc::new(SizedOutputExecutor {
-            bytes: crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES / 2 + 1,
-        }));
+        executors.insert(Arc::new(SizedOutputExecutor { bytes: 250 * 1024 + 1 }));
         let mut tools = [web_search];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
@@ -1080,7 +1076,7 @@ mod tests {
             OutputItem::FunctionCall(web_search_call("call_b")),
         ];
         let mut scheduler = GatewayScheduler::plan(&output_items, &registry, 0, GatewaySchedulerPolicy::default());
-        let response_budget = ExecutorResponseBudget::new();
+        let response_budget = ExecutorResponseBudget::with_limit(500 * 1024);
 
         let error = scheduler
             .execute_with_budget(&response_budget)
@@ -1584,7 +1580,8 @@ mod tests {
             )],
         );
         let discovered_output = crate::tool::mcp::handler::list_tools_output_item(&list_tools);
-        let public_output = super::public_output_items(&[discovered_output], &ToolRegistry::default(), &[]);
+        let public_output =
+            super::public_output_items(&[discovered_output], &ToolRegistry::default(), &[]).expect("public output");
         let plans = super::mcp_list_tools_event_plans(&public_output, 0);
         let (sender, mut receiver) = mpsc::channel(32);
         let mut stream_accumulator = crate::executor::gateway_accumulator::GatewayStreamAccumulator::new();

@@ -1,73 +1,112 @@
-use std::collections::HashSet;
-use std::sync::Arc;
-
-use futures::StreamExt;
-use serde::Deserialize;
-use serde_json::Value;
-
-use crate::events::{EventFrame, SSEEventType, WireEvent, ensure_supported_output_item_type};
-use crate::executor::accumulator::ResponseAccumulator;
+use crate::executor::accumulator::Validation;
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::function_sse::FunctionSseTranslator;
-use crate::executor::gateway::{
-    emit_gateway_completed_events, emit_gateway_start_events, mcp_list_tools_event_plans, public_output_items,
-};
-use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame};
-use crate::executor::inference::{call_inference, fetch_response_json};
+use crate::executor::gateway_accumulator::StreamEvent;
+use crate::executor::inference::{fetch_response_json_limited, response_lines, send_request};
+use crate::executor::pipeline::{AgentPipeline, StreamPayload};
+use crate::executor::rehydrate::validate_message_content;
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
-use crate::tool::{ToolRegistry, ToolSearchHandler};
-use crate::types::io::OutputItem;
+use crate::executor::translate::TranslationContext;
+use crate::tool::{ToolRegistry, ToolSearchState};
 use crate::types::request_response::ResponsePayload;
-use crate::utils::common::{deserialize_from_str, serialize_to_string};
+use crate::utils::common::serialize_to_string;
 
-const MAX_DEFERRED_STREAM_BYTES: usize = 256 * 1024;
-
-struct StreamEmitContext<'a> {
-    request: &'a RequestContext,
-    registry: &'a ToolRegistry,
-    sender: &'a tokio::sync::mpsc::Sender<StreamEvent>,
-    accumulator: &'a mut GatewayStreamAccumulator,
-    output_offset: usize,
-}
-
-pub(super) struct StreamPayload {
-    pub(super) payload: ResponsePayload,
-    pub(super) deferred_events: Vec<EventFrame>,
+/// Snapshot tool facts at the orchestration boundary, excluding all execution bindings.
+fn translation_context(registry: &ToolRegistry, agent: &AgentPipeline) -> TranslationContext {
+    let state = agent.tool_search_state();
+    TranslationContext::new(
+        registry
+            .tool_classifications()
+            .map(|(name, kind)| (name.to_owned(), kind))
+            .collect(),
+        state
+            .map(|state| state.withheld_function_names().clone())
+            .unwrap_or_default(),
+        state.is_some_and(ToolSearchState::is_active),
+    )
+    .with_gateway_owned_names(
+        registry
+            .tool_classifications()
+            .filter(|(name, _)| registry.is_gateway_owned_name(name))
+            .map(|(name, _)| name.to_owned())
+            .collect(),
+    )
+    .with_response_metadata(
+        registry.namespace_map().cloned(),
+        registry.custom_tool_map().cloned(),
+        state
+            .filter(|state| state.is_active())
+            .map(crate::tool::ToolSearchState::public_response_tools)
+            .or_else(|| {
+                agent
+                    .request
+                    .enriched_request
+                    .tools
+                    .as_ref()
+                    .filter(|tools| {
+                        tools
+                            .iter()
+                            .any(|tool| matches!(tool, crate::types::tools::ResponsesTool::Shell(_)))
+                    })
+                    .cloned()
+            }),
+        agent.request.enriched_request.tool_choice.clone(),
+    )
 }
 
 /// Builds the JSON body sent upstream: history inlined, continuation and storage
 /// fields removed.
 ///
 /// # Errors
-/// A tool-configuration or serialization failure.
+/// Unsupported message content, a tool-configuration error, or a serialization failure.
 pub fn upstream_request(ctx: &RequestContext, stream: bool) -> ExecutorResult<String> {
+    // Composable callers may supply RequestContext without the rehydration step.
+    validate_message_content(&ctx.enriched_request.input)?;
     let request = ctx.enriched_request.to_upstream_request(stream)?;
     serialize_to_string(&request).map_err(ExecutorError::JsonError)
 }
 
+/// One pipeline per response sender; collect-only and JSON requests have no sender.
+pub(super) fn agent_pipeline(
+    ctx: RequestContext,
+    tool_search_state: Option<ToolSearchState>,
+    sender: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+) -> AgentPipeline {
+    AgentPipeline::new(ctx, tool_search_state, sender)
+}
+
+pub(super) fn agent_pipeline_with_limits(
+    ctx: RequestContext,
+    tool_search_state: Option<ToolSearchState>,
+    sender: Option<tokio::sync::mpsc::Sender<StreamEvent>>,
+    max_stream_event_bytes: usize,
+) -> AgentPipeline {
+    AgentPipeline::with_limits(ctx, tool_search_state, sender, max_stream_event_bytes)
+}
+
 pub(super) async fn fetch_blocking_payload(
-    ctx: &RequestContext,
+    agent: &mut AgentPipeline,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     registry: &ToolRegistry,
     response_budget: Option<&ExecutorResponseBudget>,
 ) -> ExecutorResult<ResponsePayload> {
-    let url = exec_ctx.responses_url();
-    registry.ensure_request_prepared(&ctx.enriched_request)?;
-    // Non-streaming request: stream=false -> full JSON body -> from_json.
-    let upstream_json = upstream_request(ctx, false)?;
-
-    let body = fetch_response_json(upstream_json, &url, &exec_ctx.client, auth).await?;
-    if let Some(response_budget) = response_budget {
-        response_budget.consume(body.len())?;
-    }
-
-    registry.validate_blocking_response(&body)?;
-    let mut payload = payload_from_upstream(ctx, UpstreamBody::Json(&body))?;
-    let status = payload.status.parse().unwrap_or_default();
-    ToolSearchHandler::normalize_response_output(registry, &mut payload.output, status, &HashSet::new())?;
-    Ok(payload)
+    agent.ensure_request_prepared()?;
+    let upstream_json = upstream_request(&agent.request, false)?;
+    let body = fetch_response_json_limited(
+        upstream_json,
+        &exec_ctx.responses_url(),
+        &exec_ctx.client,
+        auth,
+        exec_ctx.responses_config.max_upstream_json_bytes,
+    )
+    .await?;
+    agent.run_with_json_body(
+        &body,
+        Validation::Lenient,
+        translation_context(registry, agent),
+        response_budget.cloned(),
+    )
 }
 
 /// A complete upstream response, in whichever form the caller received it.
@@ -78,364 +117,202 @@ pub enum UpstreamBody<'a> {
     Sse(&'a str),
 }
 
-fn absorb_line(acc: &mut ResponseAccumulator, ctx: &RequestContext, line: &str) -> ExecutorResult<()> {
-    if let Some(frame) = acc.process_lenient_sse_line(line)? {
-        log_upstream_failure(&frame, &ctx.response_id);
-    }
-    Ok(())
-}
-
-fn required_str<'a>(value: &'a Value, field: &str, owner: &str) -> ExecutorResult<&'a str> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| missing_field(owner, field))
-}
-
-fn missing_field(owner: &str, field: &str) -> ExecutorError {
-    ExecutorError::InvalidRequest(format!("{owner} has no valid '{field}'"))
-}
-
-/// Rejects a body [`ResponseAccumulator::from_json`] would accept too generously:
-/// it defaults a missing `status` to `completed` and drops unreadable items, which
-/// is safe for our own fetch but not for a body an outside caller supplied.
+/// Decodes a complete public body and returns its request context for persistence.
 ///
 /// # Errors
-/// [`ExecutorError::InvalidRequest`] naming the field that is missing or invalid.
-pub fn ensure_strict_response(body: &str) -> ExecutorResult<()> {
-    let json: Value = deserialize_from_str(body).map_err(ExecutorError::JsonError)?;
-    let Some(status) = json["status"].as_str() else {
-        return Err(ExecutorError::InvalidRequest(
-            "upstream response has no 'status'".to_owned(),
-        ));
-    };
-    if !matches!(status, "completed" | "failed" | "incomplete") {
-        return Err(ExecutorError::InvalidRequest(format!(
-            "upstream response status '{status}' is not terminal"
-        )));
-    }
-    let Some(items) = json["output"].as_array() else {
-        return Err(ExecutorError::InvalidRequest(
-            "upstream response has no 'output' array".to_owned(),
-        ));
-    };
-    let mut item_ids = HashSet::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
-        let owner = format!("upstream response output[{index}]");
-        let item_id = required_str(item, "id", &owner)?;
-        let item_type = required_str(item, "type", &owner)?;
-        ensure_supported_output_item_type(item_type)
-            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
-        OutputItem::deserialize(item).map_err(|error| {
-            ExecutorError::InvalidRequest(format!(
-                "upstream response output[{index}] is not a valid item: {error}"
-            ))
-        })?;
-        if !item_ids.insert(item_id) {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "upstream response repeats output item '{item_id}'"
-            )));
+/// Invalid JSON, stream lifecycle, output identity, or tool-call data.
+pub async fn decode_upstream(
+    ctx: RequestContext,
+    body: UpstreamBody<'_>,
+) -> ExecutorResult<(ResponsePayload, RequestContext)> {
+    let mut agent = agent_pipeline(ctx, None, None);
+    let payload = match body {
+        UpstreamBody::Json(body) => {
+            agent.run_with_json_body(body, Validation::Strict, TranslationContext::default(), None)?
         }
-    }
-    Ok(())
-}
-
-/// Decodes a complete upstream response, checking a caller-supplied body first.
-///
-/// # Errors
-/// [`ExecutorError::InvalidRequest`] for an incomplete response, or a parse error.
-pub fn decode_upstream(ctx: &RequestContext, upstream: UpstreamBody<'_>) -> ExecutorResult<ResponsePayload> {
-    if let UpstreamBody::Json(body) = upstream {
-        ensure_strict_response(body)?;
-    }
-    payload_from_upstream(ctx, upstream)
-}
-
-pub(super) fn payload_from_upstream(
-    ctx: &RequestContext,
-    upstream: UpstreamBody<'_>,
-) -> ExecutorResult<ResponsePayload> {
-    let acc = match upstream {
-        UpstreamBody::Json(body) => ResponseAccumulator::from_json(body, ctx.conversation_id.as_deref())?,
-        UpstreamBody::Sse(sse) => {
-            let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
-            for line in sse.lines() {
-                if let Some(frame) = acc.process_strict_sse_line(line)? {
-                    log_upstream_failure(&frame, &ctx.response_id);
-                }
-            }
-            acc.finish_strict_stream()?;
-            acc
+        UpstreamBody::Sse(body) => {
+            let lines = futures::stream::iter(body.lines().map(|line| Ok(line.to_owned())));
+            agent
+                .run_with_stream_body(
+                    lines,
+                    Validation::Strict,
+                    TranslationContext::default(),
+                    &ToolRegistry::default(),
+                    0,
+                    None,
+                )
+                .await?
+                .payload
         }
     };
-    Ok(finalize_payload(ctx, acc))
-}
-
-/// The tail both legs share: request-derived fields in, our ids stamped on.
-fn finalize_payload(ctx: &RequestContext, acc: ResponseAccumulator) -> ResponsePayload {
-    let mut payload = acc.finalize(
-        &ctx.enriched_request.model,
-        ctx.original_request.previous_response_id.as_deref(),
-        ctx.original_request.instructions.as_deref(),
-    );
-    ctx.inject_ids(&mut payload);
-    payload
+    let (ctx, _) = agent.into_parts();
+    Ok((payload, ctx))
 }
 
 pub(super) async fn fetch_stream_payload(
-    ctx: &RequestContext,
+    agent: &mut AgentPipeline,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     registry: &ToolRegistry,
-    mut stream: Option<(&mut GatewayStreamAccumulator, &tokio::sync::mpsc::Sender<StreamEvent>)>,
     output_offset: usize,
     response_budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<StreamPayload> {
-    let url = exec_ctx.responses_url();
-    registry.ensure_request_prepared(&ctx.enriched_request)?;
-    let upstream_json = upstream_request(ctx, true)?;
-    let mut line_stream = Box::pin(call_inference(
+    agent.ensure_request_prepared()?;
+    let upstream_json = upstream_request(&agent.request, true)?;
+    let response = send_request(
+        &exec_ctx.client,
+        &exec_ctx.responses_url(),
         upstream_json,
-        url,
-        Arc::clone(&exec_ctx.client),
-        auth.map(str::to_owned),
+        auth,
+        None,
         exec_ctx.streaming_timeout,
-    ));
-    let mut acc = ResponseAccumulator::new(ctx.response_id.clone(), ctx.conversation_id.clone());
-    let mut function_sse = FunctionSseTranslator::new(registry);
-    let mut defer_from_output_index = None;
-    let mut deferred_events = Vec::new();
-    let mut deferred_bytes = 0;
-    while let Some(line_result) = line_stream.next().await {
-        let line = line_result?;
-        response_budget.consume(line.len())?;
-        if stream.is_none() && !registry.tool_search_is_active() {
-            absorb_line(&mut acc, ctx, &line)?;
-            continue;
-        }
-        if let Some(translation) = acc.process_sse_line_with_translator(&line, &mut function_sse)? {
-            let previous_defer_from_output_index = defer_from_output_index;
-            defer_from_output_index = translation.defer_from_output_index.map(u64::from);
-            for frame in &translation.frames {
-                log_upstream_failure(frame, &ctx.response_id);
-            }
-            if let Some((accumulator, sender)) = stream.as_mut() {
-                let mut emit_ctx = StreamEmitContext {
-                    request: ctx,
-                    registry,
-                    sender,
-                    accumulator,
-                    output_offset,
-                };
-                for frame in translation.frames {
-                    if !is_terminal_response_event(frame.event_type) {
-                        let event_type = frame.event_type;
-                        let emitted = emit_or_defer_stream_frame(
-                            frame,
-                            &mut emit_ctx,
-                            defer_from_output_index,
-                            &mut deferred_events,
-                            &mut deferred_bytes,
-                        )
-                        .await?;
-                        if event_type == SSEEventType::ResponseInProgress && emitted {
-                            emit_mcp_discovery_lifecycle(registry, emit_ctx.accumulator, emit_ctx.sender).await?;
-                        }
-                    }
-                }
-                if defer_from_output_index != previous_defer_from_output_index {
-                    flush_released_stream_frames(
-                        &mut emit_ctx,
-                        defer_from_output_index,
-                        &mut deferred_events,
-                        &mut deferred_bytes,
-                    )
-                    .await?;
-                }
-            }
-        }
-    }
-    let function_sse_outcome = function_sse.finish()?;
-    acc.finish_stream();
-    let mut payload = finalize_payload(ctx, acc);
-    let status = payload.status.parse().unwrap_or_default();
-    ToolSearchHandler::normalize_response_output(
-        registry,
-        &mut payload.output,
-        status,
-        &function_sse_outcome.unfinished_tool_search_item_ids,
-    )?;
-    Ok(StreamPayload {
-        payload,
-        deferred_events,
-    })
-}
-
-fn log_upstream_failure(frame: &EventFrame, gateway_response_id: &str) {
-    if frame.event_type != SSEEventType::ResponseFailed {
-        return;
-    }
-
-    let response = frame.wire.rest.get("response").unwrap_or(&Value::Null);
-    let error = &response["error"];
-    let error_code = error.get("code").and_then(Value::as_str).unwrap_or_default();
-    let error_message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .unwrap_or_default();
-    let incomplete_reason = response["incomplete_details"]
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    tracing::warn!(
-        response_id = %gateway_response_id,
-        upstream_response_id = response["id"].as_str().unwrap_or_default(),
-        error_code,
-        error_message,
-        incomplete_reason,
-        "upstream response failed"
-    );
-}
-
-pub(super) async fn emit_deferred_stream_events(
-    deferred_events: Vec<EventFrame>,
-    request: &RequestContext,
-    registry: &ToolRegistry,
-    accumulator: &mut GatewayStreamAccumulator,
-    sender: &tokio::sync::mpsc::Sender<StreamEvent>,
-    output_offset: usize,
-) -> ExecutorResult<()> {
-    let mut emit_ctx = StreamEmitContext {
-        request,
-        registry,
-        sender,
-        accumulator,
-        output_offset,
-    };
-    for mut frame in deferred_events {
-        emit_stream_frame(&mut frame, &mut emit_ctx).await?;
-    }
-    Ok(())
-}
-
-fn should_defer_stream_event(frame: &EventFrame, defer_from_output_index: Option<u64>) -> bool {
-    defer_from_output_index.is_some_and(|first_hidden_index| {
-        frame
-            .wire
-            .output_index
-            .is_some_and(|output_index| output_index >= first_hidden_index)
-    })
-}
-
-async fn emit_stream_frame(frame: &mut EventFrame, emit_ctx: &mut StreamEmitContext<'_>) -> ExecutorResult<bool> {
-    apply_context_response_ids(&mut frame.wire, emit_ctx.request);
-    emit_ctx.registry.restore_tool_search_response_tools(&mut frame.wire)?;
-    emit_ctx.registry.restore_stream_event_wire(&mut frame.wire);
-    let emitted = emit_ctx.accumulator.process_event(frame, emit_ctx.output_offset);
-    if emitted {
-        emit_sse_frame(emit_ctx.sender, frame).await?;
-    }
-    Ok(emitted)
-}
-
-async fn emit_or_defer_stream_frame(
-    mut frame: EventFrame,
-    emit_ctx: &mut StreamEmitContext<'_>,
-    defer_from_output_index: Option<u64>,
-    deferred_events: &mut Vec<EventFrame>,
-    deferred_bytes: &mut usize,
-) -> ExecutorResult<bool> {
-    if should_defer_stream_event(&frame, defer_from_output_index) {
-        let frame_bytes = serialize_to_string(&frame.wire)
-            .map_err(ExecutorError::JsonError)?
-            .len();
-        let next_bytes = deferred_bytes.saturating_add(frame_bytes);
-        if next_bytes > MAX_DEFERRED_STREAM_BYTES {
-            return Err(ExecutorError::StreamError(format!(
-                "deferred stream exceeded {MAX_DEFERRED_STREAM_BYTES} buffered bytes"
-            )));
-        }
-        deferred_events.push(frame);
-        *deferred_bytes = next_bytes;
-        return Ok(false);
-    }
-    emit_stream_frame(&mut frame, emit_ctx).await
-}
-
-async fn flush_released_stream_frames(
-    emit_ctx: &mut StreamEmitContext<'_>,
-    defer_from_output_index: Option<u64>,
-    deferred_events: &mut Vec<EventFrame>,
-    deferred_bytes: &mut usize,
-) -> ExecutorResult<()> {
-    let mut pending = std::mem::take(deferred_events);
-    *deferred_bytes = 0;
-    pending.sort_by_key(|frame| frame.wire.output_index);
-    for frame in pending {
-        emit_or_defer_stream_frame(
-            frame,
-            emit_ctx,
-            defer_from_output_index,
-            deferred_events,
-            deferred_bytes,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-async fn emit_mcp_discovery_lifecycle(
-    registry: &ToolRegistry,
-    stream_accumulator: &mut GatewayStreamAccumulator,
-    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
-) -> ExecutorResult<()> {
-    let discovered_output = registry
-        .mcp_list_tool_items()
-        .map(crate::tool::mcp::handler::list_tools_output_item)
-        .collect::<Vec<_>>();
-    let public_output = public_output_items(&discovered_output, registry, &[]);
-    let event_plans = mcp_list_tools_event_plans(&public_output, 0);
-
-    emit_gateway_start_events(&event_plans, stream_accumulator, stream_sender).await?;
-    emit_gateway_completed_events(&public_output, &event_plans, stream_accumulator, stream_sender).await
-}
-
-fn is_terminal_response_event(event_type: SSEEventType) -> bool {
-    matches!(
-        event_type,
-        SSEEventType::ResponseCompleted | SSEEventType::ResponseFailed | SSEEventType::ResponseIncomplete
     )
-}
-
-fn apply_context_response_ids(wire: &mut WireEvent, ctx: &RequestContext) {
-    let Some(response) = wire.rest.get_mut("response").and_then(Value::as_object_mut) else {
-        return;
-    };
-    response.insert("id".to_owned(), Value::String(ctx.response_id.clone()));
-    if let Some(previous_response_id) = &ctx.original_request.previous_response_id {
-        response.insert(
-            "previous_response_id".to_owned(),
-            Value::String(previous_response_id.clone()),
-        );
+    .await?;
+    if let Some(mut gate) = agent.initial_commit_gate.take() {
+        gate.ready_and_wait().await?;
     }
-    if let Some(conversation_id) = &ctx.conversation_id {
-        response.insert("conversation_id".to_owned(), Value::String(conversation_id.clone()));
-    }
+    let lines = response_lines(
+        response,
+        exec_ctx.streaming_timeout,
+        exec_ctx.responses_config.max_upstream_sse_line_bytes,
+    );
+    agent
+        .run_with_stream_body(
+            lines,
+            Validation::Lenient,
+            translation_context(registry, agent),
+            registry,
+            output_offset,
+            Some(response_budget.clone()),
+        )
+        .await
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use crate::events::EventPayload;
+    use crate::events::SseLine;
+    use crate::executor::error::ResourceLimit;
     use crate::executor::modes::{ConversationHandler, ResponseHandler};
+    use crate::executor::pipeline::RoundIngestion;
     use crate::storage::{ConversationStore, ResponseStore};
     use crate::types::io::ResponsesInput;
     use crate::types::request_response::RequestPayload;
+    use serde_json::Value;
+    use std::sync::Arc;
 
-    fn request_context() -> RequestContext {
+    #[test]
+    fn translation_snapshot_owns_prepared_availability_after_registry_is_dropped() {
+        use crate::tool::{ToolSearchState, ToolType};
+        let request: RequestPayload = serde_json::from_value(serde_json::json!({
+            "model":"test", "input":"find a tool", "parallel_tool_calls":false,
+            "tools":[
+                {"type":"tool_search","execution":"client"},
+                {"type":"function","name":"hidden","defer_loading":true},
+                {"type":"custom","name":"raw_echo"}
+            ]
+        }))
+        .expect("request");
+        let registry = ToolRegistry::from_tool_types(std::collections::HashMap::from([
+            ("tool_search".to_owned(), ToolType::ToolSearch),
+            ("raw_echo".to_owned(), ToolType::Custom),
+        ]));
+        let state = ToolSearchState::build(&request).expect("prepared state");
+        let agent = agent_pipeline(request_context(), Some(state), None);
+        let context = translation_context(&registry, &agent);
+        drop(registry);
+        assert_eq!(context.tool_type("raw_echo"), ToolType::Custom);
+        assert_eq!(context.tool_type("tool_search"), ToolType::ToolSearch);
+        assert_eq!(context.tool_type("unknown"), ToolType::Function);
+        let mut pipeline = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, context, None);
+        let line = format!(
+            "data: {}",
+            serde_json::json!({
+                "type":"response.output_item.added", "output_index":0,
+                "item":{"id":"fc_hidden","type":"function_call","call_id":"call_hidden","name":"hidden","arguments":"","status":"in_progress"}
+            })
+        );
+        assert!(matches!(
+            pipeline.push(SseLine::parse(&line)),
+            Err(ExecutorError::Tool(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_metadata_and_namespace_output_translate_without_the_registry() {
+        use crate::tool::{GatewayExecutors, ToolSearchHandler};
+        let mut request = request_context();
+        request.enriched_request.tools = Some(
+            serde_json::from_value(serde_json::json!([
+                {"type":"tool_search","execution":"client"},
+                {"type":"custom","name":"raw_echo","description":"Original description"},
+                {"type":"namespace","name":"travel","tools":[{"type":"function","name":"timezone"}]}
+            ]))
+            .unwrap(),
+        );
+        request.enriched_request.parallel_tool_calls = Some(false);
+        let state = ToolSearchHandler::prepare_request(&mut request.enriched_request, &[], false).unwrap();
+        let registry = ToolRegistry::build_with_handlers(
+            request.enriched_request.tools.as_mut().unwrap(),
+            &mut GatewayExecutors::default(),
+        )
+        .await
+        .unwrap();
+        let mut agent = agent_pipeline(request, state, None);
+        let stream_context = translation_context(&registry, &agent);
+        let json_context = translation_context(&registry, &agent);
+        drop(registry);
+
+        let mut ingestion = RoundIngestion::new("resp_1".to_owned(), None, Validation::Lenient, stream_context, None);
+        let created = serde_json::json!({"type":"response.created","response":{
+            "id":"upstream","status":"in_progress","tools":[],
+            "tool_choice":{"type":"function","name":"raw_echo"}
+        }});
+        let translated = ingestion.push(SseLine::parse(&format!("data: {created}"))).unwrap();
+        let response = &translated.frames[0].wire.rest["response"];
+        let public_tools = response["tools"].clone();
+        assert!(
+            public_tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "custom" && tool["description"] == "Original description")
+        );
+        assert!(
+            public_tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "namespace" && tool["name"] == "travel")
+        );
+        assert_eq!(response["tool_choice"]["type"], "custom");
+        let item = serde_json::json!({"id":"fc_1","type":"function_call","call_id":"call_1","name":"agentic_ns__travel__timezone","arguments":"{}","status":"completed"});
+        let done = serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item});
+        let translated = ingestion.push(SseLine::parse(&format!("data: {done}"))).unwrap();
+        assert_eq!(translated.frames[0].wire.rest["item"]["namespace"], "travel");
+        assert_eq!(translated.frames[0].wire.rest["item"]["name"], "timezone");
+        let stream_payload = ingestion.finish("test", None, None).unwrap();
+        let body = serde_json::json!({"id":"upstream","status":"completed","output":[item]}).to_string();
+        let json_payload = agent
+            .run_with_json_body(&body, Validation::Lenient, json_context, None)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&stream_payload.output).unwrap(),
+            serde_json::to_value(&json_payload.output).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&json_payload.output).unwrap()[0]["namespace"],
+            "travel"
+        );
+        assert_eq!(serde_json::to_value(&stream_payload.tools).unwrap(), public_tools);
+        assert_eq!(serde_json::to_value(&json_payload.tools).unwrap(), public_tools);
+        assert_eq!(
+            serde_json::to_value(&stream_payload.tool_choice).unwrap(),
+            serde_json::to_value(&json_payload.tool_choice).unwrap()
+        );
+    }
+
+    pub(in crate::executor) fn request_context() -> RequestContext {
         let request = RequestPayload {
             model: "test".to_owned(),
             input: ResponsesInput::Text("hi".to_owned()),
@@ -466,81 +343,8 @@ mod tests {
             response_id: "resp_test".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            continuation: None,
         }
-    }
-
-    fn frame(output_index: u64, payload: Value) -> EventFrame {
-        let mut wire = WireEvent::new("response.output_item.added");
-        wire.output_index = Some(output_index);
-        wire.rest.insert("item".to_owned(), payload);
-        EventFrame {
-            event_type: SSEEventType::OutputItemAdded,
-            payload: EventPayload::None,
-            wire,
-        }
-    }
-
-    #[tokio::test]
-    async fn released_frames_are_emitted_in_output_index_order() {
-        let request = request_context();
-        let registry = ToolRegistry::default();
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let mut accumulator = GatewayStreamAccumulator::new();
-        let mut emit_ctx = StreamEmitContext {
-            request: &request,
-            registry: &registry,
-            sender: &sender,
-            accumulator: &mut accumulator,
-            output_offset: 0,
-        };
-        let mut deferred = vec![
-            frame(3, serde_json::json!({"id": "msg_3"})),
-            frame(2, serde_json::json!({"id": "msg_2"})),
-        ];
-        let mut deferred_bytes = deferred
-            .iter()
-            .map(|frame| serialize_to_string(&frame.wire).unwrap().len())
-            .sum();
-
-        flush_released_stream_frames(&mut emit_ctx, None, &mut deferred, &mut deferred_bytes)
-            .await
-            .expect("flush succeeds");
-        assert_eq!(deferred_bytes, 0);
-
-        let indices = [receiver.try_recv().unwrap(), receiver.try_recv().unwrap()].map(|event| {
-            let data_line = event
-                .content
-                .lines()
-                .find(|line| line.starts_with("data: "))
-                .expect("SSE data line");
-            crate::events::normalize_sse_line(data_line)
-                .and_then(|frame| frame.wire.output_index)
-                .expect("output index")
-        });
-        assert_eq!(indices, [2, 3]);
-    }
-
-    #[tokio::test]
-    async fn deferred_frames_have_a_shared_byte_limit() {
-        let request = request_context();
-        let registry = ToolRegistry::default();
-        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
-        let mut accumulator = GatewayStreamAccumulator::new();
-        let mut emit_ctx = StreamEmitContext {
-            request: &request,
-            registry: &registry,
-            sender: &sender,
-            accumulator: &mut accumulator,
-            output_offset: 0,
-        };
-        let mut deferred = Vec::new();
-        let mut deferred_bytes = 0;
-        let oversized = frame(0, Value::String("x".repeat(256 * 1024 + 1)));
-
-        let error = emit_or_defer_stream_frame(oversized, &mut emit_ctx, Some(0), &mut deferred, &mut deferred_bytes)
-            .await
-            .expect_err("oversized deferred stream must fail");
-        assert!(error.to_string().contains("deferred stream exceeded"));
     }
 
     #[test]
@@ -553,21 +357,190 @@ mod tests {
             .consume(crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES / 2)
             .expect("second round should consume the budget");
         let error = budget.consume(1).expect_err("next round must exceed shared budget");
-        assert!(error.to_string().contains("executor response budget exceeded"));
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
+    }
+
+    async fn streaming_test_upstream(events: &[Value]) -> (ExecutionContext, tokio::task::JoinHandle<()>) {
+        use std::fmt::Write as _;
+
+        let mut body = String::new();
+        for event in events {
+            write!(&mut body, "data: {event}\n\n").unwrap();
+        }
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let body = body.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let context = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+            format!("http://{address}"),
+        );
+        (context, server)
+    }
+
+    #[tokio::test]
+    async fn live_and_collect_only_streams_finalize_the_same_payload() {
+        let item = serde_json::json!({"id":"fc_1","type":"function_call","call_id":"call_1","name":"raw_echo","arguments":"{\"input\":\"hello\"}","status":"completed"});
+        let events = [
+            serde_json::json!({"type":"response.created","response":{"id":"resp_upstream","status":"in_progress"}}),
+            serde_json::json!({"type":"response.in_progress","response":{"id":"resp_upstream","status":"in_progress"}}),
+            serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            serde_json::json!({"type":"response.completed","response":{"id":"resp_upstream","status":"completed","output":[item],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let registry = ToolRegistry::from_tool_types(std::collections::HashMap::from([(
+            "raw_echo".to_owned(),
+            crate::tool::ToolType::Custom,
+        )]));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+        let mut agent = agent_pipeline(request_context(), None, Some(sender));
+        let live = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &registry,
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .unwrap();
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let collected = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &registry,
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let mut live_payload = serde_json::to_value(live.payload).unwrap();
+        let mut collected_payload = serde_json::to_value(collected.payload).unwrap();
+        live_payload.as_object_mut().unwrap().remove("created_at");
+        collected_payload.as_object_mut().unwrap().remove("created_at");
+        assert_eq!(live_payload, collected_payload);
+        assert_eq!(live_payload["id"], agent.request.response_id);
+        assert_eq!(live_payload["usage"]["total_tokens"], 5);
+        assert!(live.deferred_events.is_empty());
+        assert!(collected.deferred_events.is_empty());
+        let mut emitted = String::new();
+        while let Ok(event) = receiver.try_recv() {
+            emitted.push_str(&event.content);
+        }
+        assert!(emitted.contains("custom_tool_call"));
+        assert!(!emitted.contains("function_call_arguments"));
+    }
+
+    #[tokio::test]
+    async fn collect_only_streams_enforce_live_translation_errors_and_limits() {
+        let added = serde_json::json!({"type":"response.output_item.added","output_index":0,
+            "item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"raw_echo","arguments":"","status":"in_progress"}});
+        let contradiction = vec![
+            added.clone(),
+            serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"{\"input\":\"first"}),
+            serde_json::json!({"type":"response.output_item.done","output_index":0,
+                "item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"raw_echo","arguments":"{\"input\":\"different\"}","status":"completed"}}),
+        ];
+        let mut unnamed = added;
+        unnamed["item"].as_object_mut().unwrap().remove("name");
+        let oversized = vec![
+            unnamed,
+            serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"x".repeat(140 * 1024)}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_1","delta":"x".repeat(140 * 1024)}),
+        ];
+        let registry = ToolRegistry::from_tool_types(std::collections::HashMap::from([(
+            "raw_echo".to_owned(),
+            crate::tool::ToolType::Custom,
+        )]));
+        for (events, expected_error) in [
+            (contradiction, "contradicts streamed custom tool input"),
+            (oversized, "unnamed function-call SSE exceeded"),
+        ] {
+            let (exec_ctx, server) = streaming_test_upstream(&events).await;
+            let mut errors = Vec::new();
+            for emit in [false, true] {
+                let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+                let mut agent = agent_pipeline(request_context(), None, emit.then_some(sender));
+                let error = fetch_stream_payload(
+                    &mut agent,
+                    &exec_ctx,
+                    None,
+                    &registry,
+                    0,
+                    &ExecutorResponseBudget::new(),
+                )
+                .await
+                .expect_err("translation must reject the stream");
+                assert!(error.to_string().contains(expected_error), "{error}");
+                errors.push(error.to_string());
+            }
+            server.abort();
+            assert_eq!(errors[0], errors[1]);
+        }
     }
 
     #[tokio::test]
     async fn streamed_response_reader_enforces_the_cumulative_budget() {
         use std::fmt::Write as _;
 
-        let data = "x".repeat(200 * 1024);
+        let item_id = "msg_1";
+        let delta = "x".repeat(300 * 1024);
         let mut response = String::new();
-        for sequence_number in 0..6 {
-            write!(
-                &mut response,
-                "data: {{\"type\":\"test.event\",\"sequence_number\":{sequence_number},\"delta\":\"{data}\"}}\n\n"
-            )
-            .expect("writing to a String cannot fail");
+        let events = [
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "status": "in_progress"
+                }
+            }),
+            serde_json::json!({
+                "type": "response.content_part.added",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": delta
+            }),
+            serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": item_id,
+                "content_index": 0,
+                "delta": delta
+            }),
+        ];
+        for event in &events {
+            write!(&mut response, "data: {event}\n\n").expect("writing to a String cannot fail");
         }
         let app = axum::Router::new().route(
             "/v1/responses",
@@ -586,24 +559,534 @@ mod tests {
         let exec_ctx = ExecutionContext::new(
             ConversationHandler::new(ConversationStore::disabled()),
             ResponseHandler::new(ResponseStore::disabled()),
-            Arc::new(reqwest::Client::new()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
             format!("http://{address}"),
         );
-        let budget = ExecutorResponseBudget::new();
+        let budget = ExecutorResponseBudget::with_limit(500 * 1024);
 
-        let error = fetch_stream_payload(
-            &request_context(),
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect_err("cumulative streamed response must be bounded");
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
+        server.abort();
+    }
+
+    fn synthetic_events(size: usize, chunk: usize) -> (Value, Vec<Value>) {
+        let text = "x".repeat(size);
+        let part = serde_json::json!({"type": "output_text", "text": text, "annotations": []});
+        let item = serde_json::json!({
+            "id": "msg_fixture",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [part]
+        });
+        let response = serde_json::json!({
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1_789_151_000,
+            "model": "fixture",
+            "status": "completed",
+            "output": [item],
+            "error": null,
+            "incomplete_details": null
+        });
+        let initial = serde_json::json!({
+            "id": "resp_fixture",
+            "object": "response",
+            "created_at": 1_789_151_000,
+            "model": "fixture",
+            "status": "in_progress",
+            "output": [],
+            "error": null,
+            "incomplete_details": null
+        });
+        let mut events = Vec::new();
+        events.push(serde_json::json!({"type": "response.created", "response": initial}));
+        events.push(serde_json::json!({"type": "response.in_progress", "response": initial}));
+        events.push(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "msg_fixture",
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }
+        }));
+        events.push(serde_json::json!({
+            "type": "response.content_part.added",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "part": {"type": "output_text", "text": ""}
+        }));
+        let mut at = 0;
+        while at < size {
+            let end = (at + chunk).min(size);
+            events.push(serde_json::json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "item_id": "msg_fixture",
+                "content_index": 0,
+                "delta": &text[at..end]
+            }));
+            at = end;
+        }
+        events.push(serde_json::json!({
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "text": text
+        }));
+        events.push(serde_json::json!({
+            "type": "response.content_part.done",
+            "output_index": 0,
+            "item_id": "msg_fixture",
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []}
+        }));
+        events.push(serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": item
+        }));
+        events.push(serde_json::json!({
+            "type": "response.completed",
+            "response": response
+        }));
+        (response, events)
+    }
+
+    #[tokio::test]
+    async fn small_and_large_sse_chunking_and_json_produce_identical_retained_bytes() {
+        let (json_response, events_1byte) = synthetic_events(8000, 1);
+        let (_, events_1024byte) = synthetic_events(8000, 1024);
+
+        // 1. Stream with 1-byte chunks and 1 MiB budget
+        // In the original bug (Issue #288), 8000 1-byte chunks failed after 7,655 bytes with a 1 MiB budget
+        // because wire bytes charged 1,048,582 bytes. Now it succeeds!
+        let budget_1byte = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events_1byte).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_1byte =
+            fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget_1byte)
+                .await
+                .expect("1-byte chunks must succeed under 1 MiB budget");
+        server.abort();
+
+        // 2. Stream with 1024-byte chunks
+        let budget_1024byte = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events_1024byte).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_1024byte = fetch_stream_payload(
+            &mut agent,
             &exec_ctx,
             None,
             &ToolRegistry::default(),
-            None,
             0,
-            &budget,
+            &budget_1024byte,
         )
         .await
-        .err()
-        .expect("cumulative streamed response must be bounded");
-        assert!(error.to_string().contains("executor response budget exceeded"));
+        .expect("1024-byte chunks must succeed");
+        server.abort();
+
+        // 3. JSON body
+        let budget_json = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result_json = agent
+            .run_with_json_body(
+                &json_response.to_string(),
+                Validation::Strict,
+                TranslationContext::default(),
+                Some(budget_json.clone()),
+            )
+            .expect("JSON body must succeed");
+
+        // Retained bytes charged MUST be identical across 1-byte chunks, 1024-byte chunks, and JSON!
+        assert_eq!(budget_1byte.used(), budget_1024byte.used());
+        assert_eq!(budget_1byte.used(), budget_json.used());
+        // Verify payload equivalence
+        assert_eq!(
+            serde_json::to_value(&result_1byte.payload.output).unwrap(),
+            serde_json::to_value(&result_1024byte.payload.output).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&result_1byte.payload.output).unwrap(),
+            serde_json::to_value(&result_json.output).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_completion_snapshots_do_not_double_count_retained_bytes() {
+        let (json_response, events) = synthetic_events(1000, 100);
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .unwrap();
+        server.abort();
+
+        let budget_json = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let _ = agent
+            .run_with_json_body(
+                &json_response.to_string(),
+                Validation::Strict,
+                TranslationContext::default(),
+                Some(budget_json.clone()),
+            )
+            .unwrap();
+
+        assert_eq!(budget.used(), budget_json.used());
+        assert_eq!(result.payload.output.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_response_larger_than_old_stream_event_cap_succeeds_under_default_config() {
+        let (_response, events) = synthetic_events(2 * 1024 * 1024, 64 * 1024);
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(128);
+        let mut agent = agent_pipeline_with_limits(
+            request_context(),
+            None,
+            Some(sender),
+            exec_ctx.responses_config.max_stream_event_bytes,
+        );
+        let result = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .expect("2 MiB stream should succeed under default config");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        let mut saw_output_item_done = false;
+        while let Ok(event) = receiver.try_recv() {
+            if event.content.contains("response.output_item.done") {
+                saw_output_item_done = true;
+            }
+        }
+        assert!(saw_output_item_done, "stream must emit response.output_item.done");
+        let (_, mut accumulator) = agent.into_parts();
+        let terminal_chunk = accumulator
+            .terminal_response_chunk(&result.payload)
+            .expect("terminal response chunk of 2 MiB succeeds under default limit");
+        assert!(terminal_chunk.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn lenient_done_without_output_item_done_reconciles_budget() {
+        let text = "x".repeat(5000);
+        let events = vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_lenient", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_lenient",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_lenient",
+                "content_index": 0,
+                "text": &text
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_lenient", "status": "completed", "output": []}
+            }),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("lenient stream with done-only text should reconcile and succeed");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        assert!(budget.used() >= 5000);
+    }
+
+    #[tokio::test]
+    async fn lenient_done_without_output_item_done_exceeding_budget_fails_promptly() {
+        use crate::executor::error::ResourceLimit;
+
+        let text = "x".repeat(5000);
+        // Note: No terminal response.completed. The stream must fail promptly on output_text.done
+        // rather than at terminal stream completion.
+        let events = vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_lenient", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_lenient",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_text.done",
+                "output_index": 0,
+                "item_id": "msg_lenient",
+                "content_index": 0,
+                "text": &text
+            }),
+        ];
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(4000);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect_err("stream exceeding budget on done payload must fail promptly");
+        server.abort();
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                max_bytes: 4000,
+            }
+        ));
+    }
+
+    fn two_part_stream_events(deltas: bool) -> Vec<serde_json::Value> {
+        let (t0, k0, v0) = if deltas {
+            ("response.output_text.delta", "delta", "part 0 text ")
+        } else {
+            ("response.output_text.done", "text", "part 0 text ")
+        };
+        let (t1, k1, v1) = if deltas {
+            ("response.output_text.delta", "delta", "part 1 text")
+        } else {
+            ("response.output_text.done", "text", "part 1 text")
+        };
+        vec![
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "resp_2parts", "status": "in_progress"}
+            }),
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "id": "msg_2parts",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": []
+                }
+            }),
+            serde_json::json!({
+                "type": t0,
+                "output_index": 0,
+                "item_id": "msg_2parts",
+                "content_index": 0,
+                k0: v0
+            }),
+            serde_json::json!({
+                "type": t1,
+                "output_index": 0,
+                "item_id": "msg_2parts",
+                "content_index": 1,
+                k1: v1
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"id": "resp_2parts", "status": "completed", "output": []}
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn two_part_done_only_stream_preserves_both_parts() {
+        use crate::types::io::OutputItem;
+
+        let events = two_part_stream_events(false);
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let result = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("two-part done-only stream must succeed");
+        server.abort();
+        assert_eq!(result.payload.output.len(), 1);
+        if let OutputItem::Message(msg) = &result.payload.output[0] {
+            assert_eq!(msg.content.len(), 2);
+            assert_eq!(msg.content[0].text, "part 0 text ");
+            assert_eq!(msg.content[1].text, "part 1 text");
+        } else {
+            panic!("expected OutputItem::Message");
+        }
+
+        // Equivalent multi-part stream with deltas to assert budget invariance
+        let delta_events = two_part_stream_events(true);
+        let (exec_ctx_delta, server_delta) = streaming_test_upstream(&delta_events).await;
+        let delta_budget = ExecutorResponseBudget::with_limit(1024 * 1024);
+        let mut agent_delta = agent_pipeline(request_context(), None, None);
+        let result_delta = fetch_stream_payload(
+            &mut agent_delta,
+            &exec_ctx_delta,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &delta_budget,
+        )
+        .await
+        .expect("two-part delta stream must succeed");
+        server_delta.abort();
+
+        assert_eq!(budget.used(), delta_budget.used());
+        assert_eq!(
+            serde_json::to_value(&result.payload.output).unwrap(),
+            serde_json::to_value(&result_delta.payload.output).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_budget_draws_down_across_stream_rounds() {
+        let (_, events) = synthetic_events(400 * 1024, 64 * 1024);
+        let budget = ExecutorResponseBudget::with_limit(500 * 1024);
+
+        // Round 1 consumes ~400 KiB
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let _ = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect("round 1 must fit within budget");
+        server.abort();
+
+        // Round 2 tries to consume another ~400 KiB and must exceed the 500 KiB budget
+        let (exec_ctx, server) = streaming_test_upstream(&events).await;
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), 0, &budget)
+            .await
+            .expect_err("round 2 must exceed shared budget");
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                ..
+            }
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_sse_line_limit_is_enforced() {
+        use std::fmt::Write as _;
+        let mut response = String::new();
+        let huge_line = "x".repeat(1000);
+        write!(
+            &mut response,
+            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{huge_line}\"}}\n\n"
+        )
+        .unwrap();
+
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(move || {
+                let response = response.clone();
+                async move { ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], response) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+            format!("http://{address}"),
+        );
+        exec_ctx.responses_config.max_upstream_sse_line_bytes = 500;
+
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_stream_payload(
+            &mut agent,
+            &exec_ctx,
+            None,
+            &ToolRegistry::default(),
+            0,
+            &ExecutorResponseBudget::new(),
+        )
+        .await
+        .expect_err("line exceeding max_upstream_sse_line_bytes must fail");
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::UpstreamSseLine,
+                ..
+            }
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_json_body_limit_is_enforced() {
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    "x".repeat(2000),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let mut exec_ctx = ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::builder().no_proxy().build().unwrap()),
+            format!("http://{address}"),
+        );
+        exec_ctx.responses_config.max_upstream_json_bytes = 1000;
+
+        let mut agent = agent_pipeline(request_context(), None, None);
+        let error = fetch_blocking_payload(&mut agent, &exec_ctx, None, &ToolRegistry::default(), None)
+            .await
+            .expect_err("body exceeding max_upstream_json_bytes must fail");
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::UpstreamJsonBody,
+                ..
+            }
+        ));
         server.abort();
     }
 }

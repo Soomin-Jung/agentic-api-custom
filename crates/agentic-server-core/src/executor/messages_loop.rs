@@ -2,10 +2,12 @@
 //!
 //! Runs the server-side gateway-tool loop for `/v1/messages` **natively**: the
 //! client's Anthropic request is forwarded to vLLM `/v1/messages` essentially
-//! untouched (preserving every Anthropic field), the assistant turn is
+//! untouched on the first round, the assistant turn is
 //! inspected, any gateway-owned `tool_use` is executed server-side and hidden,
-//! the loop appends the `tool_result` and re-POSTs, until the model stops asking
-//! for a gateway tool. Only the final assistant message reaches the client.
+//! the loop appends the `tool_result`, relaxes a fulfilled forced tool choice,
+//! and re-POSTs until the model stops asking
+//! for a gateway tool. Only the final assistant message reaches the client,
+//! carrying the `usage` of every round.
 //!
 //! This never touches `RequestPayload`/`ResponsePayload`; it reuses only the
 //! protocol-neutral tool layer (`ToolRegistry::dispatch`) via
@@ -19,11 +21,13 @@ use serde_json::{Value, json};
 
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::inference::fetch_response_json_with_headers;
-use crate::executor::messages_request::{normalize_native_web_search, web_search_budget_exhausted_result};
+use crate::executor::messages_context::MessagesRequestContext;
+use crate::executor::messages_request::web_search_budget_exhausted_result;
+use crate::executor::messages_usage::MessagesUsageTotals;
 use crate::executor::request::ExecutionContext;
 use crate::tool::ToolRegistry;
-use crate::types::messages::tool_seam;
-use crate::utils::common::{deserialize_from_str, serialize_to_string};
+use crate::types::messages::{GatewayToolResult, tool_seam};
+use crate::utils::common::deserialize_from_str;
 
 /// Max gateway rounds before the loop gives up. Each round is one upstream
 /// `/v1/messages` call. Shared with the streaming loop (`messages_stream`).
@@ -71,38 +75,37 @@ pub struct MessagesResponse<T> {
     pub headers: http::HeaderMap,
 }
 
-/// The `tool_result` block for one executed gateway call, fed back next round.
-/// (The model's own `tool_use` block is carried forward via the preserved
-/// assistant content, not reconstructed here — see `append_round_to_history`.)
-struct ResolvedCall {
-    tool_result_block: Value,
-}
-
 /// Run the Messages-native gateway tool loop and return the final assistant
 /// message (Anthropic JSON `Value`).
 ///
-/// `request` is the client's parsed request body as JSON — forwarded upstream
-/// with `stream:false` forced and its `messages` extended each round.
+/// `ctx` carries the client's request in both views: its raw body is forwarded
+/// upstream with `stream:false` forced and its `messages` extended each round.
 ///
 /// # Errors
 /// Returns [`ExecutorError`] on upstream failure or unparseable upstream JSON.
 /// Gateway-tool execution failures do **not** error — they become error
 /// `tool_result`s fed back to the model.
 pub async fn run_messages_loop(
-    mut request: Value,
+    mut ctx: MessagesRequestContext,
     registry: &ToolRegistry,
     exec_ctx: &ExecutionContext,
     upstream: &MessagesUpstream,
 ) -> ExecutorResult<MessagesResponse<Value>> {
-    let mut web_search_budget = normalize_native_web_search(&mut request)?;
     // The loop drives turns itself; force non-streaming upstream regardless of
     // what the client asked (the handler routes streaming elsewhere).
-    request["stream"] = Value::Bool(false);
+    ctx.force_stream(false);
+    let mut usage = MessagesUsageTotals::default();
 
     for _round in 0..MAX_GATEWAY_TOOL_ROUNDS {
-        let body = serialize_to_string(&request).map_err(ExecutorError::JsonError)?;
-        let (resp_text, response_headers) =
-            fetch_response_json_with_headers(body, &upstream.url, &exec_ctx.client, &upstream.headers).await?;
+        let body = ctx.upstream_body()?;
+        let (resp_text, response_headers) = fetch_response_json_with_headers(
+            body,
+            &upstream.url,
+            &exec_ctx.client,
+            &upstream.headers,
+            exec_ctx.responses_config.max_upstream_json_bytes,
+        )
+        .await?;
         let message: Value = deserialize_from_str(&resp_text).map_err(ExecutorError::JsonError)?;
 
         // Any error body from upstream is surfaced verbatim (handler maps it to
@@ -121,10 +124,7 @@ pub async fn run_messages_loop(
         // client should see. A client-owned tool_use means we cannot continue
         // the loop server-side — return the turn to the client (edge E7).
         let Some(content) = content else {
-            return Ok(MessagesResponse {
-                body: message,
-                headers: response_headers,
-            });
+            return Ok(deliver(message, &mut usage, response_headers));
         };
         let gateway_map = &exec_ctx.messages_gateway_tools;
         let mut gateway_calls: Vec<Value> = Vec::new();
@@ -140,35 +140,35 @@ pub async fn run_messages_loop(
             }
         }
 
-        // Terminal when the model didn't ask for a gateway tool, or stopped for
-        // another reason. A client-owned tool_use is also terminal (the client
-        // must run it) — but the gateway tool_use, if any, must still be hidden
-        // (F5): strip gateway blocks from the client-facing content.
-        if gateway_calls.is_empty() || stop_reason != Some("tool_use") {
-            return Ok(MessagesResponse {
-                body: message,
-                headers: response_headers,
-            });
-        }
         if has_client_tool_use {
-            // Strip the gateway tool_use from the client-facing content (compute
-            // before mutating to end the immutable borrow of `message`).
+            // Client execution takes precedence even when the provider labels a
+            // named call end_turn. Keep hidden gateway calls out of this turn.
             let stripped = tool_seam::strip_gateway_tool_use(content, gateway_map);
             let mut message = message;
             message["content"] = Value::Array(stripped);
-            return Ok(MessagesResponse {
-                body: message,
-                headers: response_headers,
-            });
+            if message["stop_reason"] == "end_turn" {
+                message["stop_reason"] = json!("tool_use");
+            }
+            return Ok(deliver(message, &mut usage, response_headers));
         }
 
+        // The shared context accepts tool_use and vLLM's end_turn for a matching
+        // named gateway call. Other stops retain their terminal behavior.
+        if gateway_calls.is_empty()
+            || !ctx.is_tool_call_stop(
+                stop_reason,
+                gateway_calls.iter().filter_map(|call| call["name"].as_str()),
+            )
+        {
+            return Ok(deliver(message, &mut usage, response_headers));
+        }
         // Pure gateway-tool round: execute the calls, then feed the model's FULL
         // assistant turn (thinking/text/tool_use, order preserved — F3) plus the
         // tool_results back for the next round. Gateway blocks stay internal.
-        let assistant_content = content.clone();
-        let allowed_searches = web_search_budget.reserve(gateway_calls.len());
-        let resolved = execute_gateway_calls(&gateway_calls, registry, gateway_map, allowed_searches).await;
-        append_round_to_history(&mut request, &assistant_content, &resolved);
+        usage.record(message.get("usage"));
+        let allowed_searches = ctx.reserve_searches(gateway_calls.len());
+        let tool_results = execute_gateway_calls(&gateway_calls, registry, gateway_map, allowed_searches).await;
+        ctx.append_round(content, tool_results)?;
     }
 
     // Round budget exhausted — re-run once more is not attempted; return the
@@ -187,22 +187,30 @@ pub async fn run_messages_loop(
     })
 }
 
+/// Return the terminal assistant message with the turn's complete `usage`.
+fn deliver(mut message: Value, usage: &mut MessagesUsageTotals, headers: http::HeaderMap) -> MessagesResponse<Value> {
+    usage.finish(&mut message);
+    MessagesResponse { body: message, headers }
+}
+
 /// Execute the gateway-owned `tool_use` blocks concurrently, each bounded by the
 /// per-call timeout. A failure or timeout becomes an error `tool_result` (E5).
+///
+/// Returns one `tool_result` block per call, fed back next round. (The model's
+/// own `tool_use` block is carried forward via the preserved assistant content,
+/// not reconstructed here — see [`MessagesRequestContext::append_round`].)
 async fn execute_gateway_calls(
     gateway_calls: &[Value],
     registry: &ToolRegistry,
     gateway_map: &tool_seam::GatewayToolMap,
     allowed_searches: usize,
-) -> Vec<ResolvedCall> {
+) -> Vec<GatewayToolResult> {
     let futures = gateway_calls.iter().enumerate().map(|(index, block)| async move {
         let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
         let name = block.get("name").and_then(Value::as_str).unwrap_or_default();
 
         if index >= allowed_searches {
-            return ResolvedCall {
-                tool_result_block: web_search_budget_exhausted_result(id),
-            };
+            return web_search_budget_exhausted_result(id);
         }
 
         // F4: reject a malformed/absent input rather than dispatching with args
@@ -229,25 +237,7 @@ async fn execute_gateway_calls(
             )
         };
 
-        ResolvedCall {
-            tool_result_block: tool_seam::tool_result_block(id, &output, is_error),
-        }
+        tool_seam::tool_result_block(id, output, is_error)
     });
     join_all(futures).await
-}
-
-/// Append the model's assistant turn (preserving its `thinking`/`text`/`tool_use`
-/// blocks in order — F3) and a following user turn of `tool_result`s to the
-/// request `messages`, so the next upstream round sees the full conversation
-/// state. These stay internal — the client never sees them (hide-the-call).
-fn append_round_to_history(request: &mut Value, assistant_content: &[Value], resolved: &[ResolvedCall]) {
-    let assistant = json!({ "role": "assistant", "content": assistant_content });
-    let user = json!({
-        "role": "user",
-        "content": resolved.iter().map(|r| r.tool_result_block.clone()).collect::<Vec<_>>()
-    });
-    if let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) {
-        messages.push(assistant);
-        messages.push(user);
-    }
 }

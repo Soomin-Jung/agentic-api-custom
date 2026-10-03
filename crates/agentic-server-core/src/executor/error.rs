@@ -5,6 +5,25 @@ use crate::StorageError;
 use crate::tool::ToolError;
 use crate::utils::common::serialize_to_vec_or_default;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLimit {
+    ResponseBudget,
+    UpstreamSseLine,
+    UpstreamJsonBody,
+    StreamEvent,
+}
+
+impl std::fmt::Display for ResourceLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResponseBudget => write!(f, "executor response budget"),
+            Self::UpstreamSseLine => write!(f, "upstream SSE line"),
+            Self::UpstreamJsonBody => write!(f, "upstream response"),
+            Self::StreamEvent => write!(f, "stream event"),
+        }
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ExecutorError {
@@ -78,12 +97,20 @@ pub enum ExecutorError {
     #[error("{entity} not found: {id}")]
     NotFound { entity: String, id: String },
 
+    /// A response session cannot resolve the requested continuation checkpoint.
+    #[error("Previous response with id '{id}' not found.")]
+    PreviousResponseNotFound { id: String },
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 
     /// The request exceeds a documented transport or component size budget.
     #[error("{0}")]
     PayloadTooLarge(String),
+
+    /// A configured response or transport size boundary was exceeded.
+    #[error("{limit} exceeded {max_bytes} bytes")]
+    ResourceLimitExceeded { limit: ResourceLimit, max_bytes: usize },
 
     /// The request conflicts with state already stored.
     #[error("conflict: {0}")]
@@ -128,6 +155,7 @@ impl ExecutorError {
             Self::ConversationLocked { .. }
             | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
             | Self::InvalidRequest(_)
+            | Self::PreviousResponseNotFound { .. }
             | Self::JsonError(_) => StatusCode::BAD_REQUEST,
             Self::Tool(
                 ToolError::Execution(_)
@@ -138,6 +166,10 @@ impl ExecutorError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ParseError(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::ResourceLimitExceeded { limit, .. } => match limit {
+                ResourceLimit::UpstreamSseLine | ResourceLimit::UpstreamJsonBody => StatusCode::BAD_GATEWAY,
+                ResourceLimit::ResponseBudget | ResourceLimit::StreamEvent => StatusCode::INTERNAL_SERVER_ERROR,
+            },
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -149,12 +181,17 @@ impl ExecutorError {
             Self::ConversationLocked { .. }
             | Self::Tool(ToolError::Config(_) | ToolError::MissingOutput { .. })
             | Self::InvalidRequest(_)
+            | Self::PreviousResponseNotFound { .. }
             | Self::ParseError(_)
             | Self::JsonError(_)
             | Self::PayloadTooLarge(_) => "invalid_request_error",
             Self::Storage(e) if e.is_not_found() => "not_found",
             Self::Conflict(_) => "conflict_error",
             Self::LLMRequest { .. } | Self::LLMTransport { .. } | Self::CompactionFailed { .. } => "upstream_error",
+            Self::ResourceLimitExceeded { limit, .. } => match limit {
+                ResourceLimit::UpstreamSseLine | ResourceLimit::UpstreamJsonBody => "upstream_error",
+                ResourceLimit::ResponseBudget | ResourceLimit::StreamEvent => "server_error",
+            },
             Self::Tool(
                 ToolError::Execution(_)
                 | ToolError::InvalidUpstreamToolSearch
@@ -169,8 +206,10 @@ impl ExecutorError {
     pub fn error_code(&self) -> &'static str {
         match self.client_visible_error() {
             Self::ConversationLocked { .. } => "conversation_locked",
+            Self::PreviousResponseNotFound { .. } => "previous_response_not_found",
             Self::Conflict(_) => "response_already_stored",
             Self::PayloadTooLarge(_) => "body_too_large",
+            Self::ResourceLimitExceeded { .. } => "response_resource_limit_exceeded",
             other => other.error_type(),
         }
     }
@@ -180,6 +219,7 @@ impl ExecutorError {
     pub fn error_param(&self) -> Option<&'static str> {
         match self.client_visible_error() {
             Self::ConversationLocked { .. } => Some("conversation"),
+            Self::PreviousResponseNotFound { .. } => Some("previous_response_id"),
             Self::Tool(ToolError::MissingOutput { .. }) => Some("input"),
             _ => None,
         }
@@ -258,6 +298,22 @@ mod tests {
         let storage_err = StorageError::NotConfigured;
         let exec_err = ExecutorError::from(storage_err);
         assert!(exec_err.to_string().contains("storage error"));
+    }
+
+    #[test]
+    fn previous_response_error_has_the_continuation_envelope() {
+        let error = ExecutorError::PreviousResponseNotFound {
+            id: "resp_missing".to_owned(),
+        };
+        assert_eq!(error.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&error.into_response_body()).unwrap(),
+            serde_json::json!({"error": {
+                "message": "Previous response with id 'resp_missing' not found.",
+                "type": "invalid_request_error", "code": "previous_response_not_found",
+                "param": "previous_response_id"
+            }})
+        );
     }
 
     #[test]

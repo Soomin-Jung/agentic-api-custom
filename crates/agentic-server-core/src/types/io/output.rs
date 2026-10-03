@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::events::EventPayload;
+use crate::events::types::ShellCommandUpdate;
 use crate::executor::error::ExecutorError;
 use crate::tool::ToolRegistry;
 use crate::types::event::MessageStatus;
@@ -13,8 +14,10 @@ use super::input::{
     CompactionItem, InputContent, InputFunctionToolCall, InputItem, InputMessage, InputMessageContent,
     InputTextContent, InputToolSearchCall, deserialize_non_blank_string,
 };
+use super::shell::ShellCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct OutputTextContent {
     #[serde(rename = "type")]
     pub type_: String,
@@ -34,6 +37,7 @@ impl OutputTextContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct OutputMessage {
     pub id: String,
     pub role: String,
@@ -74,7 +78,7 @@ impl From<OutputMessage> for InputMessage {
         let parts = msg
             .content
             .into_iter()
-            .map(|c| InputContent::OutputText(InputTextContent { text: c.text }))
+            .map(|c| InputContent::OutputText(InputTextContent::new(c.text)))
             .collect();
         Self {
             id: Some(msg.id),
@@ -86,6 +90,7 @@ impl From<OutputMessage> for InputMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FunctionToolCall {
     #[serde(default = "default_function_call_id")]
     #[serde(deserialize_with = "deserialize_function_call_id")]
@@ -109,6 +114,7 @@ pub struct FunctionToolCall {
 /// Unlike replay input, execution and status have no serde defaults: response
 /// translation must populate both fields explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ToolSearchCall {
     #[serde(deserialize_with = "deserialize_non_blank_string")]
     pub id: String,
@@ -123,6 +129,7 @@ pub struct ToolSearchCall {
 ///
 /// `input` is opaque text and must not be parsed as function-call JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CustomToolCall {
     #[serde(default)]
     pub id: String,
@@ -259,7 +266,51 @@ impl TryFrom<&EventPayload> for CompactionItem {
     }
 }
 
+impl TryFrom<&EventPayload> for ShellCall {
+    type Error = ExecutorError;
+
+    fn try_from(payload: &EventPayload) -> Result<Self, Self::Error> {
+        let EventPayload::OutputItemAdded {
+            shell_call: Some(call), ..
+        } = payload
+        else {
+            return Err(ExecutorError::ParseError("expected OutputItemAdded payload".into()));
+        };
+        Ok(call.as_ref().clone())
+    }
+}
+
+impl ApplyDone for ShellCall {
+    fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String) {
+        match payload {
+            EventPayload::ShellCallCommand {
+                command_index,
+                update: ShellCommandUpdate::Done(command),
+                ..
+            } => {
+                if let Some(target) = self.action.commands.get_mut(*command_index as usize) {
+                    *target = if command.is_empty() {
+                        std::mem::take(buffer)
+                    } else {
+                        buffer.clear();
+                        command.clone()
+                    };
+                }
+            }
+            EventPayload::OutputItemDone { item, .. } => {
+                // Deserialize through the tagged enum so `type` cannot enter flattened extras.
+                if let Some(OutputItem::ShellCall(call)) = deserialize_from_value_opt(item.clone()) {
+                    *self = call;
+                    buffer.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayCallStatus {
     InProgress,
@@ -281,6 +332,7 @@ impl GatewayCallStatus {
 pub type WebSearchCallStatus = GatewayCallStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum McpCallStatus {
     InProgress,
@@ -301,6 +353,7 @@ impl From<GatewayCallStatus> for McpCallStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchSource {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -308,6 +361,7 @@ pub struct WebSearchSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchActionSearch {
     #[serde(skip, default = "default_web_search_action_search_type")]
     pub type_: String,
@@ -347,12 +401,14 @@ impl WebSearchActionSearch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchActionOpenPage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchActionFindInPage {
     pub pattern: String,
     pub url: String,
@@ -365,6 +421,43 @@ pub enum WebSearchAction {
     Search(WebSearchActionSearch),
     OpenPage(WebSearchActionOpenPage),
     FindInPage(WebSearchActionFindInPage),
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for WebSearchAction {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, OneOfBuilder, SchemaType, Type};
+
+        fn tagged(type_value: &str, schema: &str) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+            AllOfBuilder::new()
+                .item(
+                    ObjectBuilder::new()
+                        .property(
+                            "type",
+                            ObjectBuilder::new()
+                                .schema_type(SchemaType::new(Type::String))
+                                .enum_values(Some([type_value])),
+                        )
+                        .required("type"),
+                )
+                .item(Ref::from_schema_name(schema))
+                .into()
+        }
+
+        OneOfBuilder::new()
+            .discriminator(Some(utoipa::openapi::schema::Discriminator::new("type")))
+            .item(tagged("search", "WebSearchActionSearch"))
+            .item(tagged("open_page", "WebSearchActionOpenPage"))
+            .item(tagged("find_in_page", "WebSearchActionFindInPage"))
+            .into()
+    }
+}
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for WebSearchAction {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("WebSearchAction")
+    }
 }
 
 impl WebSearchAction {
@@ -387,6 +480,7 @@ impl WebSearchAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct WebSearchCall {
     pub id: String,
     pub status: WebSearchCallStatus,
@@ -421,6 +515,35 @@ pub enum McpCallError {
     Unknown(Value),
 }
 
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for McpCallError {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::AnyOfBuilder::new()
+            .item(
+                utoipa::openapi::ObjectBuilder::new().schema_type(utoipa::openapi::schema::SchemaType::new(
+                    utoipa::openapi::schema::Type::String,
+                )),
+            )
+            .item(utoipa::openapi::Ref::from_schema_name("McpToolExecutionError"))
+            .item(
+                utoipa::openapi::ObjectBuilder::new().schema_type(utoipa::openapi::schema::SchemaType::from_iter([
+                    utoipa::openapi::schema::Type::Object,
+                    utoipa::openapi::schema::Type::Number,
+                    utoipa::openapi::schema::Type::Integer,
+                    utoipa::openapi::schema::Type::Boolean,
+                    utoipa::openapi::schema::Type::Array,
+                ])),
+            )
+            .into()
+    }
+}
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for McpCallError {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("McpCallError")
+    }
+}
+
 impl McpCallError {
     #[must_use]
     pub fn tool_execution(text: impl Into<String>) -> Self {
@@ -437,6 +560,7 @@ impl McpCallError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpToolExecutionError {
     #[serde(rename = "type")]
     pub type_: String,
@@ -444,6 +568,7 @@ pub struct McpToolExecutionError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpToolExecutionErrorContent {
     #[serde(rename = "type")]
     pub type_: String,
@@ -453,6 +578,7 @@ pub struct McpToolExecutionErrorContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpCall {
     pub id: String,
     pub server_label: String,
@@ -490,6 +616,7 @@ impl McpCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpListTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -517,6 +644,7 @@ impl McpListTool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct McpListTools {
     pub id: String,
     pub server_label: String,
@@ -578,6 +706,7 @@ impl TryFrom<&EventPayload> for McpCall {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReasoningTextContent {
     #[serde(rename = "type")]
     pub type_: String,
@@ -594,6 +723,7 @@ impl ReasoningTextContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReasoningOutput {
     #[serde(default)]
     pub id: String,
@@ -862,6 +992,8 @@ pub enum OutputItem {
     ToolSearchCall(ToolSearchCall),
     #[serde(rename = "custom_tool_call")]
     CustomToolCall(CustomToolCall),
+    #[serde(rename = "shell_call")]
+    ShellCall(ShellCall),
     #[serde(rename = "web_search_call")]
     WebSearchCall(WebSearchCall),
     #[serde(rename = "mcp_call")]
@@ -876,6 +1008,50 @@ pub enum OutputItem {
     Unknown,
 }
 
+#[cfg(feature = "openapi")]
+impl utoipa::PartialSchema for OutputItem {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::Ref;
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, OneOfBuilder, SchemaType, Type};
+
+        fn tagged(type_value: &str, schema: &str) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+            AllOfBuilder::new()
+                .item(
+                    ObjectBuilder::new()
+                        .property(
+                            "type",
+                            ObjectBuilder::new()
+                                .schema_type(SchemaType::new(Type::String))
+                                .enum_values(Some([type_value])),
+                        )
+                        .required("type"),
+                )
+                .item(Ref::from_schema_name(schema))
+                .into()
+        }
+
+        OneOfBuilder::new()
+            .discriminator(Some(utoipa::openapi::schema::Discriminator::new("type")))
+            .item(tagged("message", "OutputMessage"))
+            .item(tagged("function_call", "FunctionToolCall"))
+            .item(tagged("tool_search_call", "ToolSearchCall"))
+            .item(tagged("custom_tool_call", "CustomToolCall"))
+            .item(tagged("shell_call", "ShellCall"))
+            .item(tagged("web_search_call", "WebSearchCall"))
+            .item(tagged("mcp_call", "McpCall"))
+            .item(tagged("mcp_list_tools", "McpListTools"))
+            .item(tagged("reasoning", "ReasoningOutput"))
+            .item(tagged("compaction", "CompactionItem"))
+            .into()
+    }
+}
+#[cfg(feature = "openapi")]
+impl utoipa::ToSchema for OutputItem {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("OutputItem")
+    }
+}
+
 impl OutputItem {
     /// Returns the output item's wire ID, if the item has a known type.
     #[must_use]
@@ -885,6 +1061,7 @@ impl OutputItem {
             Self::FunctionCall(item) => Some(&item.id),
             Self::ToolSearchCall(item) => Some(&item.id),
             Self::CustomToolCall(item) => Some(&item.id),
+            Self::ShellCall(item) => item.id.as_deref(),
             Self::WebSearchCall(item) => Some(&item.id),
             Self::McpCall(item) => Some(&item.id),
             Self::McpListTools(item) => Some(&item.id),
@@ -900,7 +1077,7 @@ impl OutputItem {
             Self::FunctionCall(call) => registry
                 .lookup(&call.name)
                 .is_none_or(|entry| !entry.ownership.is_gateway()),
-            Self::ToolSearchCall(_) | Self::CustomToolCall(_) => true,
+            Self::ToolSearchCall(_) | Self::CustomToolCall(_) | Self::ShellCall(_) => true,
             Self::Message(_)
             | Self::WebSearchCall(_)
             | Self::McpCall(_)
@@ -923,6 +1100,7 @@ impl OutputItem {
             Self::FunctionCall(call) => Some(InputItem::FunctionCall(InputFunctionToolCall::from(call.clone()))),
             Self::ToolSearchCall(call) => InputToolSearchCall::try_from(call).ok().map(InputItem::ToolSearchCall),
             Self::CustomToolCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
+            Self::ShellCall(call) => Some(InputItem::FunctionCall(call.clone().into())),
             Self::McpListTools(list_tools) => Some(InputItem::McpListTools(list_tools.clone())),
             Self::Compaction(item) => Some(InputItem::Compaction(item.clone())),
             Self::WebSearchCall(_) | Self::McpCall(_) | Self::Unknown => None,
@@ -1071,6 +1249,35 @@ mod tests {
     }
 
     #[test]
+    fn shell_call_round_trips_and_rehydrates_as_function_input() {
+        let item: OutputItem = serde_json::from_value(serde_json::json!({
+            "type": "shell_call",
+            "id": "sh_1",
+            "call_id": "call_1",
+            "action": {
+                "commands": ["pwd"],
+                "timeout_ms": 1000,
+                "max_output_length": 4096
+            },
+            "status": "completed"
+        }))
+        .unwrap();
+
+        assert!(item.requires_client_action(&ToolRegistry::default()));
+        let Some(InputItem::FunctionCall(call)) = item.to_input_item() else {
+            panic!("shell call should rehydrate as a function call input item");
+        };
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(call.name, "shell");
+        assert_eq!(call.id.as_deref(), Some("fc_1"));
+        let action: serde_json::Value = serde_json::from_str(&call.arguments).unwrap();
+        assert_eq!(action["commands"], serde_json::json!(["pwd"]));
+
+        let serialized = serde_json::to_value(item).unwrap();
+        assert_eq!(serialized["type"], "shell_call");
+    }
+
+    #[test]
     fn web_search_call_rejects_empty_queries() {
         let error = WebSearchCall::try_new("ws_1", WebSearchCallStatus::Completed, Vec::new(), Vec::new()).unwrap_err();
 
@@ -1166,9 +1373,10 @@ mod tests {
     #[test]
     fn reasoning_output_builds_from_added_and_applies_indexed_done_events() {
         let added = EventPayload::OutputItemAdded {
+            shell_call: None,
             item_id: "rs_1".to_owned(),
             item_type: crate::events::SSEItemType::Reasoning,
-            output_index: 2,
+            output_index: Some(2),
             name: None,
             namespace: None,
             call_id: None,
@@ -1180,7 +1388,7 @@ mod tests {
                 &EventPayload::ReasoningTextDone {
                     text: text.to_owned(),
                     item_id: "rs_1".to_owned(),
-                    output_index: 2,
+                    output_index: Some(2),
                     content_index,
                 },
                 &mut String::new(),
@@ -1191,7 +1399,7 @@ mod tests {
                 &EventPayload::ReasoningSummaryTextDone {
                     text: text.to_owned(),
                     item_id: "rs_1".to_owned(),
-                    output_index: 2,
+                    output_index: Some(2),
                     summary_index,
                 },
                 &mut String::new(),
@@ -1216,7 +1424,7 @@ mod tests {
         let done = EventPayload::OutputItemDone {
             item_id: "rs_1".to_owned(),
             item_type: crate::events::SSEItemType::Reasoning,
-            output_index: 0,
+            output_index: Some(0),
             item: serde_json::json!({
                 "id": "rs_1",
                 "type": "reasoning",
@@ -1240,7 +1448,7 @@ mod tests {
         let malformed = EventPayload::OutputItemDone {
             item_id: "rs_1".to_owned(),
             item_type: crate::events::SSEItemType::Reasoning,
-            output_index: 0,
+            output_index: Some(0),
             item: serde_json::json!({
                 "id": "rs_1",
                 "type": "reasoning",
@@ -1260,7 +1468,7 @@ mod tests {
             &EventPayload::ReasoningTextDone {
                 text: String::new(),
                 item_id: "rs_1".to_owned(),
-                output_index: 0,
+                output_index: Some(0),
                 content_index: 0,
             },
             &mut stale_delta,
@@ -1274,7 +1482,7 @@ mod tests {
             &EventPayload::ReasoningSummaryTextDone {
                 text: String::new(),
                 item_id: "rs_1".to_owned(),
-                output_index: 0,
+                output_index: Some(0),
                 summary_index: 0,
             },
             &mut stale_summary_delta,
@@ -1367,9 +1575,10 @@ mod tests {
     #[test]
     fn mcp_list_tools_builds_from_added_and_applies_done_item() {
         let added = EventPayload::OutputItemAdded {
+            shell_call: None,
             item_id: "mcpl_1".to_owned(),
             item_type: crate::events::SSEItemType::McpListTools,
-            output_index: 0,
+            output_index: Some(0),
             name: None,
             namespace: None,
             call_id: None,
@@ -1382,7 +1591,7 @@ mod tests {
         let done = EventPayload::OutputItemDone {
             item_id: "mcpl_1".to_owned(),
             item_type: crate::events::SSEItemType::McpListTools,
-            output_index: 0,
+            output_index: Some(0),
             item: serde_json::json!({
                 "type": "mcp_list_tools",
                 "id": "mcpl_1",
@@ -1468,8 +1677,8 @@ mod tests {
             "role": "user",
             "content": [
                 {
-                    "type": "input_file",
-                    "file_id": "file_1"
+                    "type": "future_content",
+                    "payload": "future_value"
                 }
             ]
         });
@@ -1481,6 +1690,6 @@ mod tests {
         let InputMessageContent::Parts(parts) = &message.content else {
             panic!("expected message parts");
         };
-        assert!(matches!(parts.as_slice(), [InputContent::Unknown]));
+        assert!(matches!(parts.as_slice(), [InputContent::Unknown(kind)] if kind == "future_content"));
     }
 }

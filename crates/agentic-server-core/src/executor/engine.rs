@@ -5,36 +5,49 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod diagnostics;
+mod streaming;
+use diagnostics::log_custom_tool_calls;
+#[cfg(test)]
+use streaming::panicked_stream_chunks;
+use streaming::prepare_stream;
+
 use std::sync::Arc;
 
-use async_stream::stream;
 use either::Either;
+#[cfg(test)]
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::compaction::{compact_items, maybe_compact_context};
+use super::compaction::compact_items;
+mod preparation;
 use super::gateway::{
-    GatewayCallResult, GatewayScheduler, GatewaySchedulerPolicy, append_gateway_calls_to_new_input,
-    append_output_items_to_input, append_tool_outputs, compaction_event_plans, emit_gateway_completed_events,
-    emit_gateway_start_events, emit_response_start_events, execute_and_emit_output_calls, has_client_owned_calls,
-    public_output_items,
+    GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input, append_output_items_to_input,
+    append_tool_outputs, compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events,
+    emit_response_start_events, execute_and_emit_output_calls, has_client_owned_calls, public_output_items,
 };
-use super::gateway_accumulator::{GatewayStreamAccumulator, STREAM_EVENT_BUFFER, StreamEvent, error_sse_chunk};
+#[cfg(test)]
+use super::gateway_accumulator::{GatewayStreamAccumulator, STREAM_EVENT_BUFFER, StreamEvent};
 use crate::events::EventFrame;
-use crate::executor::error::{ExecutorError, ExecutorResult};
+use crate::executor::error::ExecutorResult;
+#[cfg(test)]
 use crate::executor::inference::DONE_MARKER;
 use crate::executor::persist::persist_if_needed;
+use crate::executor::pipeline::{AgentPipeline, emit_deferred_stream_events};
 use crate::executor::prepare::prepare_request_tools;
-use crate::executor::rehydrate::{prepare_reasoning_for_vllm, rehydrate_conversation, validate_reasoning_for_vllm};
+use crate::executor::rehydrate::{prepare_reasoning_for_vllm, validate_reasoning_for_vllm};
 use crate::executor::request::{ExecutionContext, RequestContext};
 use crate::executor::response_budget::ExecutorResponseBudget;
 #[cfg(test)]
 use crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES;
-use crate::executor::upstream::{emit_deferred_stream_events, fetch_blocking_payload, fetch_stream_payload};
+#[cfg(test)]
+use crate::executor::upstream::agent_pipeline;
+use crate::executor::upstream::{agent_pipeline_with_limits, fetch_blocking_payload, fetch_stream_payload};
 use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use crate::types::request_response::{IncompleteDetails, RequestPayload, ResponsePayload};
 use crate::utils::common::utcnow_str;
+use preparation::prepare_round;
 
 pub use crate::executor::inference::BoxStream;
 
@@ -110,69 +123,39 @@ fn accumulate_usage(total: &mut Option<ResponseUsage>, usage: Option<ResponseUsa
     }
 }
 
-struct AbortOnDrop<T> {
-    handle: tokio::task::JoinHandle<T>,
-}
-
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self { handle }
-    }
-}
-
-impl<T> std::ops::Deref for AbortOnDrop<T> {
-    type Target = tokio::task::JoinHandle<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.handle
-    }
-}
-
-impl<T> std::ops::DerefMut for AbortOnDrop<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.handle
-    }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if !self.handle.is_finished() {
-            self.handle.abort();
-        }
-    }
-}
-
 async fn run_until_gateway_tools_complete(
-    ctx: RequestContext,
-    tool_search_state: Option<ToolSearchState>,
+    agent: &mut AgentPipeline,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
     stream_upstream: bool,
-    mut stream: Option<(&mut GatewayStreamAccumulator, &mpsc::Sender<StreamEvent>)>,
-) -> ExecutorResult<(ResponsePayload, RequestContext, Option<ToolSearchMetadata>)> {
-    if ctx.original_request.input.has_compaction_trigger() {
-        let tool_search_metadata = tool_search_state.map(ToolSearchState::into_public_metadata);
-        let (payload, ctx) = run_compaction_trigger(ctx, exec_ctx, auth).await?;
-        if let Some((stream_accumulator, stream_sender)) = stream.as_mut() {
+) -> ExecutorResult<(ResponsePayload, Option<ToolSearchMetadata>)> {
+    if agent.request.original_request.input.has_compaction_trigger() {
+        let tool_search_metadata = agent.take_tool_search_metadata();
+        let payload = run_compaction_trigger(&mut agent.request, exec_ctx, auth).await?;
+        if let Some(mut gate) = agent.initial_commit_gate.take() {
+            gate.ready_and_wait().await?;
+        }
+        if let (_, Some((stream_accumulator, stream_sender))) = agent.parts_mut() {
             emit_response_start_events(&payload, stream_accumulator, stream_sender).await?;
             let event_plans = compaction_event_plans(&payload.output, 0);
             emit_gateway_start_events(&event_plans, stream_accumulator, stream_sender).await?;
             emit_gateway_completed_events(&payload.output, &event_plans, stream_accumulator, stream_sender).await?;
         }
-        return Ok((payload, ctx, tool_search_metadata));
+        return Ok((payload, tool_search_metadata));
     }
-
-    run_gateway_tool_loop(ctx, tool_search_state, exec_ctx, auth, stream_upstream, stream).await
+    EngineOrchestration::new(agent, exec_ctx)
+        .await?
+        .run(auth, stream_upstream)
+        .await
 }
 
 async fn build_tool_registry(
-    ctx: &mut RequestContext,
-    tool_search_state: Option<ToolSearchState>,
+    agent: &mut AgentPipeline,
     exec_ctx: &ExecutionContext,
     response_budget: &ExecutorResponseBudget,
 ) -> ExecutorResult<ToolRegistry> {
     let mut executors = exec_ctx.gateway_executors.request_scoped();
-    let mut registry: ToolRegistry = match ctx.enriched_request.tools.as_mut() {
+    let mut registry: ToolRegistry = match agent.request.enriched_request.tools.as_mut() {
         Some(tools) => {
             let policy = exec_ctx.gateway_scheduler_policy.clone();
             ToolRegistry::build_with_handlers_guarded(
@@ -185,8 +168,11 @@ async fn build_tool_registry(
         }
         None => ToolRegistry::default(),
     };
-    registry.install_tool_search_state(tool_search_state)?;
-    registry.cache_listed_mcp_tools(&ctx.enriched_request.input);
+    if let Some(state) = agent.tool_search_state().filter(|state| state.is_active()) {
+        registry
+            .validate_tool_availability(state.withheld_function_names(), state.synthetic_tool_search().is_some())?;
+    }
+    registry.cache_listed_mcp_tools(&agent.request.enriched_request.input);
     Ok(registry)
 }
 
@@ -197,150 +183,267 @@ fn prepare_initial_reasoning_for_vllm(input: &mut ResponsesInput, round: usize, 
     Ok(())
 }
 
-async fn run_gateway_tool_loop(
-    mut ctx: RequestContext,
-    tool_search_state: Option<ToolSearchState>,
-    exec_ctx: &ExecutionContext,
-    auth: Option<&str>,
-    stream_upstream: bool,
-    mut stream: Option<(&mut GatewayStreamAccumulator, &mpsc::Sender<StreamEvent>)>,
-) -> ExecutorResult<(ResponsePayload, RequestContext, Option<ToolSearchMetadata>)> {
-    let response_budget = ExecutorResponseBudget::new();
-    let mut registry = build_tool_registry(&mut ctx, tool_search_state, exec_ctx, &response_budget).await?;
-    let mut combined_output: Vec<OutputItem> = registry
-        .mcp_list_tool_items()
-        .map(mcp::handler::list_tools_output_item)
-        .collect();
-    let mut combined_usage = None;
+fn record_round_history(
+    ctx: &mut RequestContext,
+    output_items: &[OutputItem],
+    registry: &ToolRegistry,
+    public_output_count: usize,
+) {
+    // Explicit conversations append public output through their durable handler;
+    // the session lease still serializes execution but must not record it twice.
+    if let Some(continuation) = ctx
+        .continuation
+        .as_mut()
+        .filter(|_| ctx.original_request.conversation_id.is_none())
+    {
+        // The canonical sequence includes reasoning and intermediate messages in
+        // their original positions, followed by this round's tool call outputs.
+        // Discovery records are appended separately from the public response.
+        ctx.new_input_items.extend(
+            output_items
+                .iter()
+                .filter(|item| !matches!(item, OutputItem::McpListTools(_)))
+                .filter_map(OutputItem::to_input_item),
+        );
+        continuation.mark_outputs_recorded(public_output_count);
+    } else {
+        append_gateway_calls_to_new_input(ctx, output_items, registry);
+    }
+}
 
-    for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
-        let compaction_usage = maybe_compact_context(&mut ctx, exec_ctx, auth).await?;
-        prepare_initial_reasoning_for_vllm(&mut ctx.enriched_request.input, round, compaction_usage.is_some())?;
-        accumulate_usage(&mut combined_usage, compaction_usage);
-        let output_offset = combined_output.len();
-        let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
-            let stream_payload = fetch_stream_payload(
-                &ctx,
-                exec_ctx,
-                auth,
-                &registry,
-                stream
-                    .as_mut()
-                    .map(|(accumulator, sender)| (&mut **accumulator, *sender)),
-                output_offset,
-                &response_budget,
-            )
-            .await?;
-            if round == 0 {
-                registry.clear_mcp_list_tool_items();
-            }
-            (stream_payload.payload, stream_payload.deferred_events)
-        } else {
-            (
-                fetch_blocking_payload(&ctx, exec_ctx, auth, &registry, Some(&response_budget)).await?,
-                Vec::new(),
-            )
-        };
-        registry.restore_final_payload_output(&mut payload.output);
-        accumulate_usage(&mut combined_usage, payload.usage.take());
-        let current_output = std::mem::take(&mut payload.output);
-        if matches!(payload.status.as_str(), "error" | "failed") {
-            combined_output.extend(current_output);
-            finalize_loop(&mut payload, combined_output, combined_usage, &ctx, &registry);
-            let tool_search_metadata = registry.take_tool_search_metadata();
-            return Ok((payload, ctx, tool_search_metadata));
-        }
-        log_custom_tool_calls(&current_output, &ctx.response_id);
-        let has_client_owned = has_client_owned_calls(&current_output, &registry);
-        let gateway_results = execute_and_emit_round_output_calls(
-            &current_output,
-            &registry,
-            output_offset,
-            deferred_stream_events,
-            &ctx,
-            GatewayExecutionResources {
-                policy: exec_ctx.gateway_scheduler_policy.clone(),
-                response_budget: &response_budget,
-            },
-            stream
-                .as_mut()
-                .map(|(accumulator, sender)| (&mut **accumulator, *sender)),
-        )
-        .await?;
-        let public_output = public_output_items(&current_output, &registry, &gateway_results);
-        combined_output.extend(public_output);
+/// Request-scoped owner of registry-backed tool orchestration and its shared byte budget.
+struct EngineOrchestration<'a> {
+    agent: &'a mut AgentPipeline,
+    registry: ToolRegistry,
+    response_budget: ExecutorResponseBudget,
+    exec_ctx: &'a ExecutionContext,
+}
 
-        // A terminal incomplete response may still contain completed gateway
-        // calls. Record those results, but never start another inference round.
-        if payload.status == "incomplete" {
-            record_gateway_round_input(&mut ctx, &current_output, &registry, gateway_results);
-            finalize_loop(&mut payload, combined_output, combined_usage, &ctx, &registry);
-            let tool_search_metadata = registry.take_tool_search_metadata();
-            return Ok((payload, ctx, tool_search_metadata));
-        }
-
-        match classify_round(has_client_owned, &gateway_results, round, MAX_GATEWAY_TOOL_ROUNDS) {
-            // Client-owned calls (function, custom, or Codex namespace tools)
-            // are handed back to the caller. Gateway calls in the same round are
-            // still recorded so the returned conversation is complete.
-            LoopDecision::RequiresClientAction => {
-                record_gateway_round_input(&mut ctx, &current_output, &registry, gateway_results);
-                finalize_loop(&mut payload, combined_output, combined_usage, &ctx, &registry);
-                let tool_search_metadata = registry.take_tool_search_metadata();
-                return Ok((payload, ctx, tool_search_metadata));
-            }
-            // No gateway work remains — this turn is the final response.
-            LoopDecision::Done => {
-                finalize_loop(&mut payload, combined_output, combined_usage, &ctx, &registry);
-                let tool_search_metadata = registry.take_tool_search_metadata();
-                return Ok((payload, ctx, tool_search_metadata));
-            }
-            // Budget exhausted while the model was still requesting gateway
-            // tools: surface the accumulated work as a partial
-            // `status: "incomplete"` response instead of failing the request.
-            // The final round's gateway calls and outputs are recorded so a
-            // continuation is not fed a dangling tool call.
-            LoopDecision::Incomplete(reason) => {
-                record_gateway_round_input(&mut ctx, &current_output, &registry, gateway_results);
-                finalize_loop(&mut payload, combined_output, combined_usage, &ctx, &registry);
-                "incomplete".clone_into(&mut payload.status);
-                payload.incomplete_details = Some(IncompleteDetails { reason: Some(reason) });
-                let tool_search_metadata = registry.take_tool_search_metadata();
-                return Ok((payload, ctx, tool_search_metadata));
-            }
-            // Gateway tools ran and rounds remain; feed outputs back and loop.
-            LoopDecision::Continue => {
-                ctx.enriched_request.tool_choice = Some(ToolChoice::Auto);
-                append_output_items_to_input(&mut ctx.enriched_request.input, &current_output);
-                record_gateway_round_input(&mut ctx, &current_output, &registry, gateway_results);
-            }
-        }
+impl<'a> EngineOrchestration<'a> {
+    async fn new(agent: &'a mut AgentPipeline, exec_ctx: &'a ExecutionContext) -> ExecutorResult<Self> {
+        let response_budget = ExecutorResponseBudget::with_limit(exec_ctx.responses_config.max_retained_bytes);
+        let registry = build_tool_registry(agent, exec_ctx, &response_budget).await?;
+        Ok(Self {
+            agent,
+            registry,
+            response_budget,
+            exec_ctx,
+        })
     }
 
-    unreachable!("the final round returns Done, RequiresClientAction, or Incomplete");
-}
+    async fn run(
+        mut self,
+        auth: Option<&str>,
+        stream_upstream: bool,
+    ) -> ExecutorResult<(ResponsePayload, Option<ToolSearchMetadata>)> {
+        let mut combined_output: Vec<OutputItem> = self
+            .registry
+            .mcp_list_tool_items()
+            .map(mcp::handler::list_tools_output_item)
+            .collect();
+        let mut combined_usage = None;
 
-fn record_gateway_round_input(
-    ctx: &mut RequestContext,
-    output: &[OutputItem],
-    registry: &ToolRegistry,
-    results: Vec<GatewayCallResult>,
-) {
-    append_gateway_calls_to_new_input(ctx, output, registry);
-    append_tool_outputs(ctx, results.into_iter().map(|result| result.input_item).collect());
-}
-
-fn log_custom_tool_calls(output: &[OutputItem], response_id: &str) {
-    for item in output {
-        if let OutputItem::CustomToolCall(call) = item {
-            debug!(
-                response_id,
-                call_id = %call.call_id,
-                name = %call.name,
-                input_bytes = call.input.len(),
-                "custom tool call requires client execution"
+        for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
+            accumulate_usage(
+                &mut combined_usage,
+                prepare_round(self.agent, self.exec_ctx, auth, round).await?,
             );
+            let output_offset = combined_output.len();
+            let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
+                let stream_payload = fetch_stream_payload(
+                    self.agent,
+                    self.exec_ctx,
+                    auth,
+                    &self.registry,
+                    output_offset,
+                    &self.response_budget,
+                )
+                .await?;
+                if round == 0 {
+                    self.registry.clear_mcp_list_tool_items();
+                }
+                (stream_payload.payload, stream_payload.deferred_events)
+            } else {
+                (
+                    fetch_blocking_payload(
+                        self.agent,
+                        self.exec_ctx,
+                        auth,
+                        &self.registry,
+                        Some(&self.response_budget),
+                    )
+                    .await?,
+                    Vec::new(),
+                )
+            };
+            accumulate_usage(&mut combined_usage, payload.usage.take());
+            let current_output = std::mem::take(&mut payload.output);
+            if matches!(payload.status.as_str(), "error" | "failed") {
+                self.emit_failed_round_events(deferred_stream_events, output_offset)
+                    .await?;
+                combined_output.extend(current_output);
+                finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
+                return Ok((payload, self.agent.take_tool_search_metadata()));
+            }
+            log_custom_tool_calls(&current_output, &self.agent.request.response_id);
+            let has_client_owned = has_client_owned_calls(&current_output, &self.registry);
+            let gateway_results = self
+                .execute_round_output(&current_output, output_offset, deferred_stream_events)
+                .await?;
+            let public_output = public_output_items(&current_output, &self.registry, &gateway_results)?;
+            combined_output.extend(public_output);
+            record_round_history(
+                &mut self.agent.request,
+                &current_output,
+                &self.registry,
+                combined_output.len(),
+            );
+
+            // A terminal incomplete response may still contain completed gateway
+            // calls. Record those results, but never start another inference round.
+            if payload.status == "incomplete" {
+                self.record_gateway_results(gateway_results);
+                finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
+                let tool_search_metadata = self.agent.take_tool_search_metadata();
+                return Ok((payload, tool_search_metadata));
+            }
+
+            match classify_round(has_client_owned, &gateway_results, round, MAX_GATEWAY_TOOL_ROUNDS) {
+                // Client-owned calls (function, custom, or Codex namespace tools)
+                // are handed back to the caller. Gateway calls in the same round are
+                // still recorded so the returned conversation is complete.
+                LoopDecision::RequiresClientAction => {
+                    self.record_gateway_results(gateway_results);
+                    finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
+                    let tool_search_metadata = self.agent.take_tool_search_metadata();
+                    return Ok((payload, tool_search_metadata));
+                }
+                // No gateway work remains — this turn is the final response.
+                LoopDecision::Done => {
+                    finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
+                    let tool_search_metadata = self.agent.take_tool_search_metadata();
+                    return Ok((payload, tool_search_metadata));
+                }
+                // Budget exhausted while the model was still requesting gateway
+                // tools: surface the accumulated work as a partial
+                // `status: "incomplete"` response instead of failing the request.
+                // The final round's gateway calls and outputs are recorded so a
+                // continuation is not fed a dangling tool call.
+                LoopDecision::Incomplete(reason) => {
+                    self.record_gateway_results(gateway_results);
+                    finalize_loop(&mut payload, combined_output, combined_usage, &self.agent.request);
+                    "incomplete".clone_into(&mut payload.status);
+                    payload.incomplete_details = Some(IncompleteDetails { reason: Some(reason) });
+                    let tool_search_metadata = self.agent.take_tool_search_metadata();
+                    return Ok((payload, tool_search_metadata));
+                }
+                // Gateway tools ran and rounds remain; feed outputs back and loop.
+                LoopDecision::Continue => {
+                    self.agent.request.enriched_request.tool_choice = Some(ToolChoice::Auto);
+                    append_output_items_to_input(&mut self.agent.request.enriched_request.input, &current_output);
+                    self.record_gateway_results(gateway_results);
+                }
+            }
         }
+
+        unreachable!("the final round returns Done, RequiresClientAction, or Incomplete");
+    }
+
+    async fn emit_failed_round_events(
+        &mut self,
+        deferred_events: Vec<EventFrame>,
+        output_offset: usize,
+    ) -> ExecutorResult<()> {
+        // A failed round skips tool execution, but its deferred public events
+        // (including upstream diagnostics) still precede the terminal event.
+        let (ctx, stream) = self.agent.parts_mut();
+        if let Some((accumulator, sender)) = stream {
+            emit_deferred_stream_events(deferred_events, ctx, accumulator, sender, output_offset).await?;
+        }
+        Ok(())
+    }
+
+    fn record_gateway_results(&mut self, results: Vec<GatewayCallResult>) {
+        append_tool_outputs(
+            &mut self.agent.request,
+            results.into_iter().map(|result| result.input_item).collect(),
+        );
+    }
+
+    async fn execute_round_output(
+        &mut self,
+        output_items: &[OutputItem],
+        output_offset: usize,
+        deferred_events: Vec<EventFrame>,
+    ) -> ExecutorResult<Vec<GatewayCallResult>> {
+        let (ctx, stream) = self.agent.parts_mut();
+        let (stream_accumulator, stream_sender) = match (deferred_events.is_empty(), stream) {
+            (false, Some(stream)) => stream,
+            (_, stream) => {
+                return execute_and_emit_output_calls(
+                    output_items,
+                    &self.registry,
+                    output_offset,
+                    self.exec_ctx.gateway_scheduler_policy.clone(),
+                    &self.response_budget,
+                    stream,
+                )
+                .await;
+            }
+        };
+        let mut events_by_output = Vec::with_capacity(output_items.len());
+        events_by_output.resize_with(output_items.len(), Vec::new);
+        let mut remaining_events = Vec::new();
+        for frame in deferred_events {
+            let Some(output_index) = frame
+                .wire
+                .output_index
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < events_by_output.len())
+            else {
+                remaining_events.push(frame);
+                continue;
+            };
+            events_by_output[output_index].push(frame);
+        }
+
+        let mut scheduler = GatewayScheduler::plan(
+            output_items,
+            &self.registry,
+            output_offset,
+            self.exec_ctx.gateway_scheduler_policy.clone(),
+        );
+        let initial_event_run_len = scheduler.initial_event_run_len(output_items, &self.registry);
+        emit_gateway_start_events(
+            scheduler.event_plans().take(initial_event_run_len),
+            stream_accumulator,
+            stream_sender,
+        )
+        .await?;
+
+        let gateway_results = scheduler.execute_with_budget(&self.response_budget).await?;
+        for (index, output_events) in events_by_output.iter_mut().enumerate() {
+            if let Some(call_index) = scheduler.call_index_for_item(index) {
+                let plan = scheduler
+                    .event_plan(call_index)
+                    .expect("scheduled call index always has an event plan");
+                let result = std::slice::from_ref(&gateway_results[call_index]);
+                if call_index >= initial_event_run_len {
+                    emit_gateway_start_events(std::iter::once(plan), stream_accumulator, stream_sender).await?;
+                }
+                emit_gateway_completed_events(result, std::iter::once(plan), stream_accumulator, stream_sender).await?;
+            }
+            emit_deferred_stream_events(
+                std::mem::take(output_events),
+                ctx,
+                stream_accumulator,
+                stream_sender,
+                output_offset,
+            )
+            .await?;
+        }
+        emit_deferred_stream_events(remaining_events, ctx, stream_accumulator, stream_sender, output_offset).await?;
+        Ok(gateway_results)
     }
 }
 
@@ -350,10 +453,10 @@ fn log_custom_tool_calls(output: &[OutputItem], response_id: &str) {
 /// The trigger never reaches the upstream model; the summary inference is a
 /// normal blocking call against the same backend as standalone compaction.
 async fn run_compaction_trigger(
-    mut ctx: RequestContext,
+    ctx: &mut RequestContext,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
-) -> ExecutorResult<(ResponsePayload, RequestContext)> {
+) -> ExecutorResult<ResponsePayload> {
     let model = ctx.enriched_request.model.clone();
     let instructions = ctx.enriched_request.instructions.clone();
     let input = std::mem::replace(&mut ctx.enriched_request.input, ResponsesInput::Items(Vec::new()));
@@ -362,6 +465,9 @@ async fn run_compaction_trigger(
         unreachable!("compact_items always appends a compaction item");
     };
     ctx.new_input_items = compacted;
+    if let Some(continuation) = &mut ctx.continuation {
+        continuation.mark_history_replaced();
+    }
     let mut payload = ResponsePayload {
         id: ctx.response_id.clone(),
         object: "response".to_owned(),
@@ -379,139 +485,7 @@ async fn run_compaction_trigger(
         tool_choice: None,
     };
     ctx.inject_ids(&mut payload);
-    Ok((payload, ctx))
-}
-
-#[derive(Clone)]
-struct GatewayExecutionResources<'a> {
-    policy: GatewaySchedulerPolicy,
-    response_budget: &'a ExecutorResponseBudget,
-}
-
-async fn execute_and_emit_round_output_calls(
-    output_items: &[OutputItem],
-    registry: &ToolRegistry,
-    output_offset: usize,
-    deferred_events: Vec<EventFrame>,
-    ctx: &RequestContext,
-    resources: GatewayExecutionResources<'_>,
-    stream: Option<(&mut GatewayStreamAccumulator, &mpsc::Sender<StreamEvent>)>,
-) -> ExecutorResult<Vec<GatewayCallResult>> {
-    match (deferred_events.is_empty(), stream) {
-        (true, stream) => {
-            execute_and_emit_output_calls(
-                output_items,
-                registry,
-                output_offset,
-                resources.policy.clone(),
-                resources.response_budget,
-                stream,
-            )
-            .await
-        }
-        (false, Some((stream_accumulator, stream_sender))) => {
-            execute_and_emit_ordered_output_calls(
-                output_items,
-                registry,
-                output_offset,
-                deferred_events,
-                ctx,
-                resources,
-                (stream_accumulator, stream_sender),
-            )
-            .await
-        }
-        (false, None) => {
-            execute_and_emit_output_calls(
-                output_items,
-                registry,
-                output_offset,
-                resources.policy.clone(),
-                resources.response_budget,
-                None,
-            )
-            .await
-        }
-    }
-}
-
-async fn execute_and_emit_ordered_output_calls(
-    output_items: &[OutputItem],
-    registry: &ToolRegistry,
-    output_offset: usize,
-    deferred_events: Vec<EventFrame>,
-    ctx: &RequestContext,
-    resources: GatewayExecutionResources<'_>,
-    stream: (&mut GatewayStreamAccumulator, &mpsc::Sender<StreamEvent>),
-) -> ExecutorResult<Vec<GatewayCallResult>> {
-    let (stream_accumulator, stream_sender) = stream;
-    let mut events_by_output = Vec::with_capacity(output_items.len());
-    events_by_output.resize_with(output_items.len(), Vec::new);
-    let mut remaining_events = Vec::new();
-    for frame in deferred_events {
-        let Some(output_index) = frame
-            .wire
-            .output_index
-            .and_then(|index| usize::try_from(index).ok())
-            .filter(|index| *index < events_by_output.len())
-        else {
-            remaining_events.push(frame);
-            continue;
-        };
-        events_by_output[output_index].push(frame);
-    }
-
-    let mut scheduler = GatewayScheduler::plan(output_items, registry, output_offset, resources.policy.clone());
-    let initial_event_run_len = scheduler.initial_event_run_len(output_items, registry);
-    emit_gateway_start_events(
-        scheduler.event_plans().take(initial_event_run_len),
-        stream_accumulator,
-        stream_sender,
-    )
-    .await?;
-
-    let gateway_results = scheduler.execute_with_budget(resources.response_budget).await?;
-    for (index, output_events) in events_by_output.iter_mut().enumerate() {
-        if let Some(call_index) = scheduler.call_index_for_item(index) {
-            let plan = scheduler
-                .event_plan(call_index)
-                .expect("scheduled call index always has an event plan");
-            let result = std::slice::from_ref(&gateway_results[call_index]);
-            if call_index >= initial_event_run_len {
-                emit_gateway_start_events(std::iter::once(plan), stream_accumulator, stream_sender).await?;
-            }
-            emit_gateway_completed_events(result, std::iter::once(plan), stream_accumulator, stream_sender).await?;
-            emit_deferred_stream_events(
-                std::mem::take(output_events),
-                ctx,
-                registry,
-                stream_accumulator,
-                stream_sender,
-                output_offset,
-            )
-            .await?;
-        } else {
-            emit_deferred_stream_events(
-                std::mem::take(output_events),
-                ctx,
-                registry,
-                stream_accumulator,
-                stream_sender,
-                output_offset,
-            )
-            .await?;
-        }
-    }
-    emit_deferred_stream_events(
-        remaining_events,
-        ctx,
-        registry,
-        stream_accumulator,
-        stream_sender,
-        output_offset,
-    )
-    .await?;
-    Ok(gateway_results)
+    Ok(payload)
 }
 
 /// Move accumulated output/usage onto the terminating round's payload and
@@ -522,15 +496,10 @@ fn finalize_loop(
     combined_output: Vec<crate::types::io::OutputItem>,
     combined_usage: Option<ResponseUsage>,
     ctx: &RequestContext,
-    registry: &ToolRegistry,
 ) {
     payload.output = combined_output;
     payload.usage = combined_usage;
     ctx.inject_ids(payload);
-    if let Some(tools) = registry.tool_search_response_tools() {
-        payload.tools = Some(tools);
-        payload.tool_choice = Some(ctx.enriched_request.tool_choice.clone().unwrap_or_default());
-    }
 }
 
 async fn run_blocking(
@@ -538,178 +507,17 @@ async fn run_blocking(
     tool_search_state: Option<ToolSearchState>,
     exec_ctx: &ExecutionContext,
     auth: Option<&str>,
+    max_stream_event_bytes: usize,
 ) -> ExecutorResult<ResponsePayload> {
-    let (payload, ctx, tool_search_metadata) =
-        run_until_gateway_tools_complete(ctx, tool_search_state, exec_ctx, auth, false, None).await?;
+    let mut agent = agent_pipeline_with_limits(ctx, tool_search_state, None, max_stream_event_bytes);
+    let (payload, tool_search_metadata) = run_until_gateway_tools_complete(&mut agent, exec_ctx, auth, false).await?;
+    let (ctx, _) = agent.into_parts();
 
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
     persist_if_needed(payload.clone(), ctx, tool_search_metadata, ch, rh).await?;
 
     Ok(payload)
-}
-
-fn run_stream(
-    ctx: RequestContext,
-    tool_search_state: Option<ToolSearchState>,
-    exec_ctx: Arc<ExecutionContext>,
-    auth: Option<String>,
-) -> BoxStream {
-    Box::pin(stream! {
-        let failure_context = StreamFailureContext::from(&ctx);
-        let (event_tx, mut event_rx) = mpsc::channel(STREAM_EVENT_BUFFER);
-        let exec_ctx_for_run = Arc::clone(&exec_ctx);
-        let event_tx_for_run = event_tx.clone();
-        let stream_accumulator = GatewayStreamAccumulator::new();
-        let mut run_handle = AbortOnDrop::new(tokio::spawn(async move {
-            let mut stream_accumulator = stream_accumulator;
-            let result = run_until_gateway_tools_complete(
-                ctx,
-                tool_search_state,
-                exec_ctx_for_run.as_ref(),
-                auth.as_deref(),
-                true,
-                Some((&mut stream_accumulator, &event_tx_for_run)),
-            )
-            .await;
-            (result, stream_accumulator)
-        }));
-
-        let mut next_sequence_number = 0;
-        loop {
-            tokio::select! {
-                Some(event) = event_rx.recv() => {
-                    yield consume_stream_event(event, &mut next_sequence_number);
-                }
-                result = &mut run_handle.handle => {
-                    match result {
-                        Err(e) => {
-                            for chunk in panicked_stream_chunks(&e, &mut event_rx, &mut next_sequence_number) {
-                                yield chunk;
-                            }
-                        }
-                        Ok((Err(e), mut stream_accumulator)) => {
-                            while let Ok(event) = event_rx.try_recv() {
-                                yield consume_stream_event(event, &mut next_sequence_number);
-                            }
-                            if e.is_invalid_upstream_tool_search() {
-                                let payload = failure_context.failed_payload(&e);
-                                match stream_accumulator.terminal_response_chunk(&payload) {
-                                    Ok(chunk) => yield chunk,
-                                    Err(serialize_error) => {
-                                        yield GatewayStreamAccumulator::executor_error_chunk_at(
-                                            &serialize_error,
-                                            next_sequence_number,
-                                        );
-                                    }
-                                }
-                            } else {
-                                yield GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number);
-                            }
-                            yield DONE_MARKER.to_string();
-                        }
-                        Ok((Ok((payload, ctx, tool_search_metadata)), stream_accumulator)) => {
-                            while let Ok(event) = event_rx.try_recv() {
-                                yield consume_stream_event(event, &mut next_sequence_number);
-                            }
-                            // Codex may close its WebSocket as soon as it receives
-                            // `response.completed`. Persist before exposing that
-                            // event so a custom call/output continuation cannot be
-                            // cancelled by the client disconnect.
-                            let ch = exec_ctx.conv_handler.clone();
-                            let rh = exec_ctx.resp_handler.clone();
-                            let mut terminal_accumulator = stream_accumulator.clone();
-                            let terminal_chunk = terminal_accumulator.terminal_response_chunk(&payload);
-                            match terminal_chunk {
-                                Err(e) => {
-                                    yield GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number);
-                                }
-                                Ok(chunk) => match persist_if_needed(payload, ctx, tool_search_metadata, ch, rh).await {
-                                    Ok(()) => yield chunk,
-                                    Err(e) => {
-                                        yield GatewayStreamAccumulator::executor_error_chunk_at(
-                                            &e,
-                                            next_sequence_number,
-                                        );
-                                    }
-                                }
-                            }
-                            yield DONE_MARKER.to_string();
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-    })
-}
-
-struct StreamFailureContext {
-    response_id: String,
-    conversation_id: Option<String>,
-    model: String,
-    previous_response_id: Option<String>,
-    instructions: Option<String>,
-}
-
-impl From<&RequestContext> for StreamFailureContext {
-    fn from(ctx: &RequestContext) -> Self {
-        Self {
-            response_id: ctx.response_id.clone(),
-            conversation_id: ctx.conversation_id.clone(),
-            model: ctx.enriched_request.model.clone(),
-            previous_response_id: ctx.original_request.previous_response_id.clone(),
-            instructions: ctx.original_request.instructions.clone(),
-        }
-    }
-}
-
-impl StreamFailureContext {
-    fn failed_payload(&self, error: &ExecutorError) -> ResponsePayload {
-        ResponsePayload {
-            id: self.response_id.clone(),
-            object: "response".to_owned(),
-            created_at: utcnow_str(),
-            model: self.model.clone(),
-            status: "failed".to_owned(),
-            output: Vec::new(),
-            usage: None,
-            incomplete_details: None,
-            error: Some(serde_json::json!({
-                "message": error.error_message(),
-                "type": error.error_type(),
-                "code": error.error_code(),
-            })),
-            previous_response_id: self.previous_response_id.clone(),
-            conversation_id: self.conversation_id.clone(),
-            instructions: self.instructions.clone(),
-            tools: None,
-            tool_choice: None,
-        }
-    }
-}
-
-fn consume_stream_event(event: StreamEvent, next_sequence_number: &mut u64) -> String {
-    *next_sequence_number = event.sequence_number.saturating_add(1);
-    event.content
-}
-
-fn stream_task_failure_chunk(error: &tokio::task::JoinError, sequence_number: u64) -> String {
-    error_sse_chunk(&format!("stream task failed: {error}"), sequence_number)
-}
-
-fn panicked_stream_chunks(
-    error: &tokio::task::JoinError,
-    event_rx: &mut mpsc::Receiver<StreamEvent>,
-    next_sequence_number: &mut u64,
-) -> Vec<String> {
-    let mut chunks = Vec::new();
-    while let Ok(event) = event_rx.try_recv() {
-        chunks.push(consume_stream_event(event, next_sequence_number));
-    }
-    chunks.push(stream_task_failure_chunk(error, *next_sequence_number));
-    chunks.push(DONE_MARKER.to_owned());
-    chunks
 }
 
 /// Create a new conversation and return its data.
@@ -719,7 +527,7 @@ fn panicked_stream_chunks(
 /// conversation before submitting response turns.
 ///
 /// # Errors
-/// Returns [`ExecutorError`] if the conversation store is unavailable.
+/// Returns [`crate::executor::error::ExecutorError`] if the conversation store is unavailable.
 pub async fn create_conversation(exec_ctx: &ExecutionContext) -> ExecutorResult<crate::ConversationData> {
     exec_ctx.conv_handler.create().await
 }
@@ -733,6 +541,8 @@ pub struct ExecuteRequest {
     payload: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,
     client_auth: Option<String>,
+    continuation: Option<super::session::ResponseContinuation>,
+    max_stream_event_bytes: Option<usize>,
 }
 
 impl ExecuteRequest {
@@ -742,7 +552,25 @@ impl ExecuteRequest {
             payload,
             exec_ctx,
             client_auth: None,
+            continuation: None,
+            max_stream_event_bytes: None,
         }
+    }
+
+    /// Bound every serialized client event, including the terminal
+    /// `response.completed`, to what the delivering transport can carry after
+    /// its own routing metadata. The configured `max_stream_event_bytes` still
+    /// applies; a larger transport limit does not raise it.
+    #[must_use]
+    pub fn with_max_stream_event_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_stream_event_bytes = Some(max_bytes);
+        self
+    }
+
+    fn effective_max_stream_event_bytes(&self) -> usize {
+        let configured = self.exec_ctx.responses_config.max_stream_event_bytes;
+        self.max_stream_event_bytes
+            .map_or(configured, |transport| transport.min(configured))
     }
 
     /// Override the bearer token for this request only; does not touch the shared [`ExecutionContext`].
@@ -752,6 +580,15 @@ impl ExecuteRequest {
         self
     }
 
+    /// Retain this turn's continuation state in the supplied serial session.
+    ///
+    /// # Errors
+    /// Returns an error when the session is busy or closed.
+    pub fn with_session(mut self, session: &super::ResponseSession) -> ExecutorResult<Self> {
+        self.continuation = Some(session.begin(self.payload.previous_response_id.as_deref())?);
+        Ok(self)
+    }
+
     /// Execute one stateful conversation turn.
     ///
     /// Returns `Either::Left(ResponsePayload)` for non-streaming requests, or
@@ -759,7 +596,7 @@ impl ExecuteRequest {
     /// a complete SSE frame ready to forward to the client.
     ///
     /// # Errors
-    /// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+    /// Returns [`crate::executor::error::ExecutorError`] if preparation or initial upstream acceptance fails. Body and later-round failures are streamed.
     pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
         debug!(
             model = %self.payload.model,
@@ -770,19 +607,25 @@ impl ExecuteRequest {
             tools = self.payload.tools.as_ref().map_or(0, Vec::len),
             "executor received responses request"
         );
-        let ctx = rehydrate_conversation(self.payload, &self.exec_ctx).await?;
+        let max_stream_event_bytes = self.effective_max_stream_event_bytes();
+        let ctx =
+            super::rehydrate::rehydrate_with_continuation(self.payload, &self.exec_ctx, self.continuation).await?;
         if !ctx.enriched_request.input.has_compaction_trigger() {
             validate_reasoning_for_vllm(&ctx.enriched_request.input)?;
         }
         let (ctx, tool_search_state) =
             prepare_request_tools(ctx, &self.exec_ctx.conv_handler, &self.exec_ctx.resp_handler).await?;
         if ctx.original_request.stream {
-            Ok(Either::Right(run_stream(
-                ctx,
-                tool_search_state,
-                self.exec_ctx,
-                self.client_auth,
-            )))
+            Ok(Either::Right(
+                prepare_stream(
+                    ctx,
+                    tool_search_state,
+                    self.exec_ctx,
+                    self.client_auth,
+                    max_stream_event_bytes,
+                )
+                .await?,
+            ))
         } else {
             Ok(Either::Left(
                 Box::pin(run_blocking(
@@ -790,6 +633,7 @@ impl ExecuteRequest {
                     tool_search_state,
                     &self.exec_ctx,
                     self.client_auth.as_deref(),
+                    max_stream_event_bytes,
                 ))
                 .await?,
             ))
@@ -802,7 +646,7 @@ impl ExecuteRequest {
 /// Thin shim over [`ExecuteRequest`] for callers that don't need per-request auth override.
 ///
 /// # Errors
-/// Returns [`ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+/// Returns [`crate::executor::error::ExecutorError`] if preparation or initial upstream acceptance fails. Body and later-round failures are streamed.
 pub async fn execute(
     request: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,
@@ -888,10 +732,18 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_upstream\",\"status\":\"completed\",\"usage\":null}}\n\n",
             "data: [DONE]\n\n",
         );
-        let app = axum::Router::new().route(
-            "/v1/responses",
-            axum::routing::post(|| async { ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], UPSTREAM_SSE) }),
-        );
+        let app = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(|_body: axum::body::Bytes| async {
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], UPSTREAM_SSE)
+                }),
+            )
+            // Read the oversized test request before replying, allowing JSON framing
+            // above the response budget without relying on an early HTTP response.
+            .layer(axum::extract::DefaultBodyLimit::max(
+                MAX_EXECUTOR_RESPONSE_BYTES + 64 * 1024,
+            ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind streaming mock inference server");
@@ -917,13 +769,14 @@ mod tests {
             "tools": [{"type": "mcp", "server_label": "large-server"}]
         }))
         .expect("valid request");
-        let mut request = RequestContext {
+        let request = RequestContext {
             original_request: payload.clone(),
             enriched_request: payload,
             new_input_items: Vec::new(),
             response_id: "resp_test".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            continuation: None,
         };
         let mut exec_ctx = ExecutionContext::new(
             ConversationHandler::new(ConversationStore::disabled()),
@@ -953,14 +806,17 @@ mod tests {
             .consume(MAX_EXECUTOR_RESPONSE_BYTES - 512)
             .expect("reserve most of the response budget");
 
-        let error = build_tool_registry(&mut request, None, &exec_ctx, &response_budget)
+        let mut request = agent_pipeline(request, None, None);
+        let error = build_tool_registry(&mut request, &exec_ctx, &response_budget)
             .await
             .expect_err("MCP discovery must share the request-wide response budget");
 
         assert!(matches!(
             error,
-            crate::executor::error::ExecutorError::StreamError(message)
-                if message.contains("response budget exceeded")
+            crate::executor::error::ExecutorError::ResourceLimitExceeded {
+                limit: crate::executor::error::ResourceLimit::ResponseBudget,
+                ..
+            } | crate::executor::error::ExecutorError::StreamError(_)
         ));
     }
 
@@ -976,13 +832,14 @@ mod tests {
             ]
         }))
         .expect("valid MCP request");
-        let mut mcp_request = RequestContext {
+        let mcp_request = RequestContext {
             original_request: mcp_payload.clone(),
             enriched_request: mcp_payload,
             new_input_items: Vec::new(),
             response_id: "resp_mcp".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            continuation: None,
         };
         let plain_payload: RequestPayload = serde_json::from_value(serde_json::json!({
             "model": "test-model",
@@ -990,13 +847,14 @@ mod tests {
             "input": "test input"
         }))
         .expect("valid request without tools");
-        let mut plain_request = RequestContext {
+        let plain_request = RequestContext {
             original_request: plain_payload.clone(),
             enriched_request: plain_payload,
             new_input_items: Vec::new(),
             response_id: "resp_plain".to_owned(),
             conversation_id: None,
             conversation_version: None,
+            continuation: None,
         };
         let mut exec_ctx = ExecutionContext::new(
             ConversationHandler::new(ConversationStore::disabled()),
@@ -1042,7 +900,8 @@ mod tests {
         }
 
         let plain_budget = ExecutorResponseBudget::new();
-        let mut plain_build = Box::pin(build_tool_registry(&mut plain_request, None, &exec_ctx, &plain_budget));
+        let mut plain_request = agent_pipeline(plain_request, None, None);
+        let mut plain_build = Box::pin(build_tool_registry(&mut plain_request, &exec_ctx, &plain_budget));
         assert!(matches!(
             futures::poll!(plain_build.as_mut()),
             std::task::Poll::Ready(Ok(_))
@@ -1050,7 +909,8 @@ mod tests {
         drop(plain_build);
 
         let mcp_budget = ExecutorResponseBudget::new();
-        let mut mcp_build = Box::pin(build_tool_registry(&mut mcp_request, None, &exec_ctx, &mcp_budget));
+        let mut mcp_request = agent_pipeline(mcp_request, None, None);
+        let mut mcp_build = Box::pin(build_tool_registry(&mut mcp_request, &exec_ctx, &mcp_budget));
         assert!(futures::poll!(mcp_build.as_mut()).is_pending());
 
         drop(held_permits.pop());
@@ -1183,6 +1043,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_terminal_response_is_not_persisted() {
         let (mut exec_ctx, server) = streaming_execution_context().await;
+        exec_ctx.responses_config.max_retained_bytes = 512 * 1024;
+        exec_ctx.responses_config.max_stream_event_bytes = 512 * 1024;
         let pool = create_pool_with_schema(Some("sqlite::memory:"))
             .await
             .expect("create response store");
