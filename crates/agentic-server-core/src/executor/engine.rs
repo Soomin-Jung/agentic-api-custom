@@ -5,10 +5,12 @@
 //! primary entry point; [`execute`] is a convenience shim for callers that don't
 //! need per-request configuration.
 
+mod diagnostics;
 mod streaming;
+use diagnostics::log_custom_tool_calls;
 #[cfg(test)]
 use streaming::panicked_stream_chunks;
-use streaming::run_stream;
+use streaming::prepare_stream;
 
 use std::sync::Arc;
 
@@ -17,7 +19,8 @@ use either::Either;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::compaction::{compact_items, maybe_compact_context};
+use super::compaction::compact_items;
+mod preparation;
 use super::gateway::{
     GatewayCallResult, GatewayScheduler, append_gateway_calls_to_new_input, append_output_items_to_input,
     append_tool_outputs, compaction_event_plans, emit_gateway_completed_events, emit_gateway_start_events,
@@ -44,6 +47,7 @@ use crate::tool::{ToolRegistry, ToolSearchMetadata, ToolSearchState, mcp};
 use crate::types::io::{InputItem, OutputItem, ResponseUsage, ResponsesInput, ToolChoice};
 use crate::types::request_response::{IncompleteDetails, RequestPayload, ResponsePayload};
 use crate::utils::common::utcnow_str;
+use preparation::prepare_round;
 
 pub use crate::executor::inference::BoxStream;
 
@@ -128,6 +132,9 @@ async fn run_until_gateway_tools_complete(
     if agent.request.original_request.input.has_compaction_trigger() {
         let tool_search_metadata = agent.take_tool_search_metadata();
         let payload = run_compaction_trigger(&mut agent.request, exec_ctx, auth).await?;
+        if let Some(mut gate) = agent.initial_commit_gate.take() {
+            gate.ready_and_wait().await?;
+        }
         if let (_, Some((stream_accumulator, stream_sender))) = agent.parts_mut() {
             emit_response_start_events(&payload, stream_accumulator, stream_sender).await?;
             let event_plans = compaction_event_plans(&payload.output, 0);
@@ -237,13 +244,10 @@ impl<'a> EngineOrchestration<'a> {
         let mut combined_usage = None;
 
         for round in 0..MAX_GATEWAY_TOOL_ROUNDS {
-            let compaction_usage = maybe_compact_context(&mut self.agent.request, self.exec_ctx, auth).await?;
-            prepare_initial_reasoning_for_vllm(
-                &mut self.agent.request.enriched_request.input,
-                round,
-                compaction_usage.is_some(),
-            )?;
-            accumulate_usage(&mut combined_usage, compaction_usage);
+            accumulate_usage(
+                &mut combined_usage,
+                prepare_round(self.agent, self.exec_ctx, auth, round).await?,
+            );
             let output_offset = combined_output.len();
             let (mut payload, deferred_stream_events): (ResponsePayload, Vec<_>) = if stream_upstream {
                 let stream_payload = fetch_stream_payload(
@@ -443,20 +447,6 @@ impl<'a> EngineOrchestration<'a> {
     }
 }
 
-fn log_custom_tool_calls(output: &[OutputItem], response_id: &str) {
-    for item in output {
-        if let OutputItem::CustomToolCall(call) = item {
-            debug!(
-                response_id,
-                call_id = %call.call_id,
-                name = %call.name,
-                input_bytes = call.input.len(),
-                "custom tool call requires client execution"
-            );
-        }
-    }
-}
-
 /// Codex CLI remote-compaction V2: the client appends a `compaction_trigger`
 /// item to the input and expects the server to run its own summarization turn
 /// and stream back exactly one `compaction` output item plus `response.completed`.
@@ -606,7 +596,7 @@ impl ExecuteRequest {
     /// a complete SSE frame ready to forward to the client.
     ///
     /// # Errors
-    /// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+    /// Returns [`crate::executor::error::ExecutorError`] if preparation or initial upstream acceptance fails. Body and later-round failures are streamed.
     pub async fn run(self) -> ExecutorResult<Either<ResponsePayload, BoxStream>> {
         debug!(
             model = %self.payload.model,
@@ -626,13 +616,16 @@ impl ExecuteRequest {
         let (ctx, tool_search_state) =
             prepare_request_tools(ctx, &self.exec_ctx.conv_handler, &self.exec_ctx.resp_handler).await?;
         if ctx.original_request.stream {
-            Ok(Either::Right(run_stream(
-                ctx,
-                tool_search_state,
-                self.exec_ctx,
-                self.client_auth,
-                max_stream_event_bytes,
-            )))
+            Ok(Either::Right(
+                prepare_stream(
+                    ctx,
+                    tool_search_state,
+                    self.exec_ctx,
+                    self.client_auth,
+                    max_stream_event_bytes,
+                )
+                .await?,
+            ))
         } else {
             Ok(Either::Left(
                 Box::pin(run_blocking(
@@ -653,7 +646,7 @@ impl ExecuteRequest {
 /// Thin shim over [`ExecuteRequest`] for callers that don't need per-request auth override.
 ///
 /// # Errors
-/// Returns [`crate::executor::error::ExecutorError`] if rehydration or (non-streaming) LLM inference fails.
+/// Returns [`crate::executor::error::ExecutorError`] if preparation or initial upstream acceptance fails. Body and later-round failures are streamed.
 pub async fn execute(
     request: RequestPayload,
     exec_ctx: Arc<ExecutionContext>,

@@ -178,20 +178,17 @@ async fn response_recovery(transport: Transport) {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = response
-                .text()
-                .await
-                .expect("a stalled error must terminate the Responses stream");
-            assert!(body.ends_with("data: [DONE]\n\n"));
-            let events: Vec<Value> = body
-                .lines()
-                .filter_map(|line| line.strip_prefix("data: "))
-                .filter(|data| *data != "[DONE]")
-                .map(|data| serde_json::from_str(data).unwrap())
-                .collect();
-            assert_eq!(events.len(), 1);
-            events[0].clone()
+            // Initial upstream rejection is now pre-stream even when reading
+            // its error body stalls. Status survives; the partial body is discarded.
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(
+                !response
+                    .headers()
+                    .get("content-type")
+                    .is_some_and(|value| value.to_str().unwrap_or_default().starts_with("text/event-stream"))
+            );
+            assert!(response.text().await.expect("bounded error body read").is_empty());
+            json!({"type":"error", "status":429})
         }
         Transport::WebSocket => {
             let (mut socket, _) = connect_async(format!("{}/v1/responses", gateway_url.replace("http:", "ws:")))

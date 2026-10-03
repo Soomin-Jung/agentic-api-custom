@@ -30,6 +30,8 @@ pub(super) struct AgentPipeline {
     tool_search_state: Option<ToolSearchState>,
     delivery: StreamDelivery,
     round: Option<RoundIngestion>,
+    pub(super) inference_round: Option<usize>,
+    pub(super) initial_commit_gate: Option<super::stream_commit::InitialStreamCommitGate>,
 }
 
 impl AgentPipeline {
@@ -43,6 +45,8 @@ impl AgentPipeline {
             tool_search_state,
             delivery: StreamDelivery::new(sender),
             round: None,
+            initial_commit_gate: None,
+            inference_round: None,
         }
     }
 
@@ -57,6 +61,8 @@ impl AgentPipeline {
             tool_search_state,
             delivery: StreamDelivery::with_max_stream_event_bytes(sender, max_stream_event_bytes),
             round: None,
+            initial_commit_gate: None,
+            inference_round: None,
         }
     }
 
@@ -151,12 +157,19 @@ impl AgentPipeline {
         budget: Option<ExecutorResponseBudget>,
     ) -> ExecutorResult<StreamPayload> {
         self.begin_round(validation, context, budget)?;
+        self.round
+            .as_mut()
+            .expect("stream round was just started")
+            .require_terminal();
         futures::pin_mut!(body);
         while let Some(line) = body.next().await {
             let translation = self.push(SseLine::parse(&line?))?;
             self.delivery
                 .accept(translation, &self.request, registry, output_offset)
                 .await?;
+            if validation == Validation::Lenient && self.round.as_ref().is_some_and(RoundIngestion::terminal_received) {
+                break;
+            }
         }
         let payload = self.finish()?;
         Ok(StreamPayload {

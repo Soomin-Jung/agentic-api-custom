@@ -1,7 +1,7 @@
 use crate::executor::accumulator::Validation;
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::StreamEvent;
-use crate::executor::inference::{call_inference_limited, fetch_response_json_limited};
+use crate::executor::inference::{fetch_response_json_limited, response_lines, send_request};
 use crate::executor::pipeline::{AgentPipeline, StreamPayload};
 use crate::executor::rehydrate::validate_message_content;
 use crate::executor::request::{ExecutionContext, RequestContext};
@@ -10,7 +10,6 @@ use crate::executor::translate::TranslationContext;
 use crate::tool::{ToolRegistry, ToolSearchState};
 use crate::types::request_response::ResponsePayload;
 use crate::utils::common::serialize_to_string;
-use std::sync::Arc;
 
 /// Snapshot tool facts at the orchestration boundary, excluding all execution bindings.
 fn translation_context(registry: &ToolRegistry, agent: &AgentPipeline) -> TranslationContext {
@@ -160,11 +159,20 @@ pub(super) async fn fetch_stream_payload(
 ) -> ExecutorResult<StreamPayload> {
     agent.ensure_request_prepared()?;
     let upstream_json = upstream_request(&agent.request, true)?;
-    let lines = call_inference_limited(
+    let response = send_request(
+        &exec_ctx.client,
+        &exec_ctx.responses_url(),
         upstream_json,
-        exec_ctx.responses_url(),
-        Arc::clone(&exec_ctx.client),
-        auth.map(str::to_owned),
+        auth,
+        None,
+        exec_ctx.streaming_timeout,
+    )
+    .await?;
+    if let Some(mut gate) = agent.initial_commit_gate.take() {
+        gate.ready_and_wait().await?;
+    }
+    let lines = response_lines(
+        response,
         exec_ctx.streaming_timeout,
         exec_ctx.responses_config.max_upstream_sse_line_bytes,
     );
@@ -191,6 +199,7 @@ pub(super) mod tests {
     use crate::types::io::ResponsesInput;
     use crate::types::request_response::RequestPayload;
     use serde_json::Value;
+    use std::sync::Arc;
 
     #[test]
     fn translation_snapshot_owns_prepared_availability_after_registry_is_dropped() {

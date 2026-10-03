@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ResponseHandler};
+use agentic_core::executor::{ConversationHandler, ExecuteRequest, ExecutionContext, ExecutorError, ResponseHandler};
 use agentic_core::storage::{ConversationStore, ResponseStore};
 use agentic_core::tool::{GatewayExecutor, ToolOutput, WebSearchHandler};
 use agentic_core::types::event::MessageStatus;
@@ -2165,7 +2165,7 @@ async fn execute_runs_large_gateway_fanout_without_hard_cap() {
 }
 
 #[tokio::test]
-async fn failed_stream_preserves_deferred_diagnostics_without_executing_tools() {
+async fn stream_error_stops_before_later_events_without_executing_tools() {
     let (you_url, mut captured_you, _you_handle) = spawn_mock_you().await;
     let call = serde_json::json!({
         "type": "function_call", "id": "fc_search", "call_id": "call_search",
@@ -2224,22 +2224,17 @@ async fn failed_stream_preserves_deferred_diagnostics_without_executing_tools() 
             .iter()
             .map(|event| event["type"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        [
-            "response.created",
-            "response.in_progress",
-            "provider.gateway_metadata",
-            "error",
-            "response.failed"
-        ]
+        ["response.created", "response.in_progress", "error"]
     );
     for (index, event) in events.iter().enumerate() {
         assert_eq!(event["sequence_number"].as_u64(), Some(u64::try_from(index).unwrap()));
     }
-    let mut delivered_diagnostic = events[3].clone();
-    delivered_diagnostic.as_object_mut().unwrap().remove("sequence_number");
-    assert_eq!(delivered_diagnostic, diagnostic);
-    assert_eq!(events[2]["metadata"]["trace_id"], "trace_failed");
-    assert_eq!(events[4]["response"]["error"]["message"], "generic failure");
+    assert!(
+        events[2]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unique upstream diagnostic")
+    );
     assert!(
         captured_you.try_recv().is_err(),
         "failed rounds must not execute gateway tools"
@@ -2247,7 +2242,7 @@ async fn failed_stream_preserves_deferred_diagnostics_without_executing_tools() 
 }
 
 #[tokio::test]
-async fn stream_error_events_escape_error_messages() {
+async fn initial_stream_error_preserves_quoted_upstream_body() {
     let app = Router::new().route(
         "/v1/responses",
         post(|| async {
@@ -2296,17 +2291,12 @@ async fn stream_error_events_escape_error_messages() {
         context_management: None,
     };
 
-    let result = ExecuteRequest::new(payload, exec_ctx).run().await.unwrap();
-    let Either::Right(stream) = result else {
-        panic!("expected streaming response");
+    let Err(ExecutorError::LLMRequest { status, body, .. }) = ExecuteRequest::new(payload, exec_ctx).run().await else {
+        panic!("expected upstream HTTP failure before exposing a stream");
     };
-    let chunks: Vec<String> = stream.collect().await;
-    let parsed = streamed_sse_events(&chunks)
-        .into_iter()
-        .find(|event| event["type"] == "error")
-        .expect("stream should include error event");
-    let error = parsed["error"]["message"].as_str().unwrap();
-    assert!(error.contains(r#"bad \"quoted\" upstream response"#), "{error}");
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["error"], "bad \"quoted\" upstream response");
 }
 
 fn web_search_function_call_response_with_id(call_id: &str) -> support::MockResponse {

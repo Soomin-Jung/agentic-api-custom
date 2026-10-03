@@ -40,6 +40,14 @@ impl RoundIngestion {
         }
     }
 
+    pub(in crate::executor) fn terminal_received(&self) -> bool {
+        self.accumulator.terminal_received()
+    }
+
+    pub(in crate::executor) fn require_terminal(&mut self) {
+        self.accumulator.require_terminal = true;
+    }
+
     /// Loads a complete response, preserving JSON status instead of applying SSE EOF policy.
     pub(in crate::executor) fn load_json_body(&mut self, body: &str) -> ExecutorResult<()> {
         if self.body_kind != BodyKind::Empty {

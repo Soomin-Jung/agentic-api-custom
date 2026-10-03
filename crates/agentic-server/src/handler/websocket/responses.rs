@@ -664,16 +664,17 @@ async fn handle_ws_request(
     // The executor validates every frame, including the terminal
     // `response.completed`, against what this socket can deliver after routing
     // metadata is attached, and does so before persisting the response.
-    let result = ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
+    let executor = ExecuteRequest::new(payload, Arc::clone(&state.exec_ctx))
         .with_auth(auth)
         .with_session(session)?
-        .with_max_stream_event_bytes(event_limit.executor_limit(stream_id.as_ref()))
-        .run()
-        .await?;
-    let Some(result) = keep_if_running(shutdown_token, result) else {
-        debug!("discarded websocket response initialized during shutdown");
+        .with_max_stream_event_bytes(event_limit.executor_limit(stream_id.as_ref()));
+    // run() now starts upstream inference before returning a stream. Reject new
+    // execution before that boundary, then drain accepted work during shutdown.
+    let Some(executor) = keep_if_running(shutdown_token, executor) else {
+        debug!("discarded websocket request before executor initialization during shutdown");
         return Ok(());
     };
+    let result = executor.run().await?;
     let Either::Right(stream) = result else {
         return Err(WsError::Executor(Box::new(ExecutorError::InvalidRequest(
             "websocket response.create must produce a stream".to_owned(),
