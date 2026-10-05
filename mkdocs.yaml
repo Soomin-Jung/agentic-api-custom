@@ -132,6 +132,7 @@ nav:
     - Tool Framework: design/tool-framework.md
   - Deploying:
     - Container: deploying/container.md
+    - v0.9.0-custom 운영 가이드: custom/v0.9.0-custom.md
     - GitHub authentication with Dex: deploying/github-oidc.md
     - Kubernetes: deploying/kubernetes.md
     - Kubernetes with kind: deploying/README.md

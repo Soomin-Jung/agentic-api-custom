@@ -14,9 +14,10 @@ use std::sync::mpsc;
 
 use futures::{Stream, StreamExt};
 
+#[cfg(test)]
+use crate::events::ClassifiedSseLine;
 use crate::events::{
-    ClassifiedSseLine, EventFrame, EventPayload, SSEEventType, SSEItemType, SseLine, ValidatedFrame,
-    normalize_sse_data_checked, output_item_identity, validate_frame,
+    EventFrame, EventPayload, SSEEventType, SSEItemType, SseLine, ValidatedFrame, output_item_identity,
 };
 use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::response_budget::{
@@ -36,6 +37,7 @@ use identity::{invalid_lifecycle, invalid_lifecycle_or_id, invalid_stream, item_
 mod completion;
 mod details;
 mod json;
+mod live;
 mod slot;
 
 use active::ActiveItem;
@@ -123,6 +125,7 @@ impl AccumulatedFunctionCall<'_> {
 #[derive(Debug)]
 pub struct ResponseAccumulator {
     validation: Validation,
+    pub(in crate::executor) require_terminal: bool,
     response_id: String,
     conversation_id: Option<String>,
     output: Vec<OutputItem>,
@@ -152,6 +155,7 @@ impl ResponseAccumulator {
     ) -> Self {
         Self {
             validation,
+            require_terminal: false,
             response_id,
             conversation_id,
             output: Vec::new(),
@@ -229,6 +233,7 @@ impl ResponseAccumulator {
 
         Ok(Self {
             validation,
+            require_terminal: false,
             response_id,
             conversation_id,
             output,
@@ -322,51 +327,6 @@ impl ResponseAccumulator {
         self.output
             .extend(self.slots.drain_output_with_budget(self.budget.as_ref())?);
         Ok(())
-    }
-
-    /// Normalize classified data once, then validate and fold under the fixed policy.
-    pub(super) fn process_line(&mut self, line: ClassifiedSseLine) -> ExecutorResult<Option<EventFrame>> {
-        let ClassifiedSseLine::Data(data) = line else {
-            return Ok(None);
-        };
-        let Some(frame) = normalize_sse_data_checked(&data).map_err(|error| invalid_stream(error.to_string()))? else {
-            if self.validation == Validation::Strict {
-                return Err(invalid_stream("upstream stream contains a malformed data frame"));
-            }
-            return Ok(None);
-        };
-        let disposition = self.process_normalized_event(&frame)?;
-        let Some(mut frame) = disposition.into_frame(frame) else {
-            return Ok(None);
-        };
-        if let EventPayload::OutputItemDone {
-            item_id,
-            item_type: SSEItemType::CodeInterpreterCall,
-            output_index: Some(index),
-            ..
-        } = &frame.payload
-            && item_id.is_empty()
-            && let Some(OutputItem::CodeInterpreterCall(call)) = self
-                .slots
-                .get(OutputIndex::new(*index))
-                .and_then(|slot| slot.state.done_item())
-        {
-            frame.set_done_item_id(&call.id);
-        }
-        Ok(Some(frame))
-    }
-
-    fn process_normalized_event(&mut self, frame: &EventFrame) -> ExecutorResult<EventDisposition> {
-        let validated = match self.validation {
-            Validation::Strict => {
-                let validated = validate_frame(frame).map_err(|error| invalid_stream(error.to_string()))?;
-                self.validate_strict_transition(frame)?;
-                Some(validated)
-            }
-            Validation::Lenient => None,
-        };
-        self.capture_terminal_details_if_needed(frame)?;
-        self.process_event_checked(frame, validated.as_ref())
     }
 
     fn validate_strict_transition(&mut self, frame: &EventFrame) -> ExecutorResult<()> {
@@ -648,7 +608,7 @@ impl ResponseAccumulator {
     ) -> ExecutorResult<ResponsePayload> {
         match self.validation {
             Validation::Strict => self.finish_strict_stream()?,
-            Validation::Lenient => self.finish_stream()?,
+            Validation::Lenient => self.finish_live_stream()?,
         }
         Ok(self.finalize(model, previous_response_id, instructions))
     }

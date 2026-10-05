@@ -1,3 +1,6 @@
+> Custom fork: upstream v0.8.0 기반 `release/v0.9.0-custom`의 오류 계약, 로깅 설정,
+> PostgreSQL 전환 절차는 [커스텀 운영 가이드](docs/custom/v0.9.0-custom.md)를 참고하세요.
+
 <div align="center">
 
 <picture>

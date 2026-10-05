@@ -39,6 +39,8 @@ pub(super) struct AgentPipeline {
     round: Option<RoundIngestion>,
     cancellation: CancellationToken,
     agent_guidance: Option<InputMessage>,
+    pub(super) inference_round: Option<usize>,
+    pub(super) initial_commit_gate: Option<super::stream_commit::InitialStreamCommitGate>,
 }
 
 impl AgentPipeline {
@@ -85,6 +87,8 @@ impl AgentPipeline {
             round: None,
             cancellation: CancellationToken::new(),
             agent_guidance: None,
+            initial_commit_gate: None,
+            inference_round: None,
         }
     }
 
@@ -101,6 +105,8 @@ impl AgentPipeline {
             round: None,
             cancellation: CancellationToken::new(),
             agent_guidance: None,
+            initial_commit_gate: None,
+            inference_round: None,
         }
     }
 
@@ -195,12 +201,19 @@ impl AgentPipeline {
         budget: Option<ExecutorResponseBudget>,
     ) -> ExecutorResult<StreamPayload> {
         self.begin_round(validation, context, budget)?;
+        self.round
+            .as_mut()
+            .expect("stream round was just started")
+            .require_terminal();
         futures::pin_mut!(body);
         while let Some(line) = body.next().await {
             let translation = self.push(SseLine::parse(&line?))?;
             self.delivery
                 .accept(translation, &self.request, registry, output_offset)
                 .await?;
+            if validation == Validation::Lenient && self.round.as_ref().is_some_and(RoundIngestion::terminal_received) {
+                break;
+            }
         }
         let payload = self.finish()?;
         Ok(StreamPayload {

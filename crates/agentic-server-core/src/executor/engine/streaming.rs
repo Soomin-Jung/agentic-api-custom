@@ -1,13 +1,14 @@
 //! Streaming execution task lifecycle, terminal validation, and failure delivery.
 
 use super::run_until_gateway_tools_complete;
-use crate::executor::error::ExecutorError;
+use crate::executor::error::{ExecutorError, ExecutorResult};
 use crate::executor::gateway_accumulator::{
     GatewayStreamAccumulator, STREAM_EVENT_BUFFER, StreamEvent, error_sse_chunk,
 };
 use crate::executor::inference::{BoxStream, DONE_MARKER};
 use crate::executor::persist::persist_if_needed;
 use crate::executor::request::{ExecutionContext, RequestContext};
+use crate::executor::stream_commit::{InitialStreamCommitWaiter, initial_stream_commit_gate};
 use crate::executor::telemetry::{ExecutionSpan, FailureCategory, InstrumentedStream};
 use crate::executor::upstream::agent_pipeline_with_limits;
 use crate::tool::{ToolSearchMetadata, ToolSearchState};
@@ -70,45 +71,125 @@ impl<T> Drop for AbortOnDrop<T> {
 /// until the terminal frame has been yielded or the stream is dropped. The
 /// executor task is instrumented with the same span so the stages it runs
 /// are parented correctly on whichever worker thread polls them.
-pub(super) fn run_stream(
+pub(super) async fn prepare_stream(
     ctx: RequestContext,
     tool_search_state: Option<ToolSearchState>,
     exec_ctx: Arc<ExecutionContext>,
     auth: Option<String>,
     max_stream_event_bytes: usize,
     mut execution: ExecutionSpan,
+) -> ExecutorResult<BoxStream> {
+    let task_span = execution.span().clone();
+    let failure_context = StreamFailureContext::from(&ctx);
+    let (event_tx, event_rx) = mpsc::channel(STREAM_EVENT_BUFFER);
+    let exec_ctx_for_run = Arc::clone(&exec_ctx);
+    let mut agent = agent_pipeline_with_limits(ctx, tool_search_state, Some(event_tx), max_stream_event_bytes);
+    let cancellation = agent
+        .request
+        .enriched_request
+        .multi_agent
+        .as_ref()
+        .is_some_and(|config| config.enabled)
+        .then(|| agent.cancellation_token());
+    let (gate, mut waiter) = initial_stream_commit_gate();
+    agent.initial_commit_gate = Some(gate);
+    let mut run_handle = AbortOnDrop::new(tokio::spawn(
+        async move {
+            let result =
+                run_until_gateway_tools_complete(&mut agent, exec_ctx_for_run.as_ref(), auth.as_deref(), true).await;
+            if let Err(error) = &result {
+                let phase = if agent.initial_commit_gate.is_some() {
+                    "request_error_before_stream"
+                } else {
+                    "downstream_stream_error"
+                };
+                crate::executor::diagnostics::log_error(
+                    &agent.request.response_id,
+                    &agent.request.enriched_request.model,
+                    phase,
+                    agent.inference_round,
+                    error,
+                );
+            }
+            if let Ok((payload, _)) = &result {
+                crate::executor::diagnostics::log_terminal(
+                    &payload.id,
+                    &payload.model,
+                    &payload.status,
+                    agent.inference_round,
+                    payload
+                        .error
+                        .as_ref()
+                        .and_then(crate::executor::diagnostics::error_message)
+                        .or_else(|| payload.incomplete_details.as_ref().and_then(|d| d.reason.as_deref())),
+                );
+            }
+            let (ctx, stream_accumulator) = agent.into_parts();
+            (
+                result.map(|(payload, metadata)| (payload, ctx, metadata)),
+                stream_accumulator,
+            )
+        }
+        .instrument(task_span),
+    ));
+    run_handle.cancellation = cancellation;
+    let error = tokio::select! {
+        ready = waiter.wait_ready() => {
+            if ready.is_err() { Some(precommit_error((&mut run_handle.handle).await)) } else { None }
+        }
+        result = &mut run_handle.handle => Some(precommit_error(result)),
+    };
+    if let Some(error) = error {
+        execution.failed(&error);
+        execution.not_delivered();
+        return Err(error);
+    }
+    tracing::debug!(target: "agentic_server", phase = "downstream_stream_prepared",
+        response_id = %failure_context.response_id, model = %failure_context.model,
+        "Responses stream is ready to expose");
+    Ok(stream_from_worker(
+        run_handle,
+        event_rx,
+        exec_ctx,
+        failure_context,
+        waiter,
+        execution,
+    ))
+}
+
+type StreamRunResult = (
+    ExecutorResult<(ResponsePayload, RequestContext, Option<ToolSearchMetadata>)>,
+    GatewayStreamAccumulator,
+);
+
+fn precommit_error(result: Result<StreamRunResult, tokio::task::JoinError>) -> ExecutorError {
+    match result {
+        Ok((Err(error), _)) => error,
+        Err(error) => ExecutorError::StreamError(format!("stream task failed before response commit: {error}")),
+        Ok((Ok(_), _)) => ExecutorError::StreamError("stream completed before initial response readiness".to_owned()),
+    }
+}
+
+fn stream_from_worker(
+    mut run_handle: AbortOnDrop<StreamRunResult>,
+    mut event_rx: mpsc::Receiver<StreamEvent>,
+    exec_ctx: Arc<ExecutionContext>,
+    failure_context: StreamFailureContext,
+    mut waiter: InitialStreamCommitWaiter,
+    mut execution: ExecutionSpan,
 ) -> BoxStream {
     let span = execution.span().clone();
-    let task_span = span.clone();
     let frames: BoxStream = Box::pin(stream! {
-            let failure_context = StreamFailureContext::from(&ctx);
-            let (event_tx, mut event_rx) = mpsc::channel(STREAM_EVENT_BUFFER);
-            let exec_ctx_for_run = Arc::clone(&exec_ctx);
-            let event_tx_for_run = event_tx.clone();
-            let mut agent = agent_pipeline_with_limits(
-                ctx,
-                tool_search_state,
-                Some(event_tx_for_run),
-                max_stream_event_bytes,
-            );
-            let cancellation = agent.request.enriched_request.multi_agent.as_ref()
-                .is_some_and(|config| config.enabled).then(|| agent.cancellation_token());
-            let mut run_handle = AbortOnDrop::new(tokio::spawn(
-                async move {
-                    let result = run_until_gateway_tools_complete(
-                        &mut agent,
-                        exec_ctx_for_run.as_ref(),
-                        auth.as_deref(),
-                        true,
-                    )
-                    .await;
-                    let (ctx, stream_accumulator) = agent.into_parts();
-                    (result.map(|(payload, metadata)| (payload, ctx, metadata)), stream_accumulator)
-                }
-                .instrument(task_span),
-            ));
-            run_handle.cancellation = cancellation;
-
+        if let Err(error) = waiter.release() {
+            execution.failed(&error);
+            yield GatewayStreamAccumulator::executor_error_chunk_at(&error, 0);
+            execution.delivered();
+            yield DONE_MARKER.to_owned();
+            return;
+        }
+        tracing::debug!(target: "agentic_server", phase = "downstream_stream_started",
+            response_id = %failure_context.response_id, model = %failure_context.model,
+            "Responses stream body is being consumed");
             let mut next_sequence_number = 0;
             loop {
                 tokio::select! {
@@ -118,6 +199,7 @@ pub(super) fn run_stream(
                     result = &mut run_handle.handle => {
                         match result {
                             Err(e) => {
+                                failure_context.log_error("downstream_stream_task_error", &ExecutorError::StreamError("stream worker failed".into()));
                                 if e.is_panic() {
                                     execution.failed_with(FailureCategory::Panic);
                                 } else {
@@ -197,11 +279,19 @@ async fn completed_stream_chunk(
     let chunk = match terminal_accumulator.terminal_response_chunk(&payload) {
         Ok(chunk) => chunk,
         Err(e) => {
+            crate::executor::diagnostics::log_error(
+                &payload.id,
+                &payload.model,
+                "downstream_terminal_serialization_error",
+                None,
+                &e,
+            );
             execution.failed(&e);
             return GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number);
         }
     };
     let status = payload.status.clone();
+    let failure_context = StreamFailureContext::from(&ctx);
     let ch = exec_ctx.conv_handler.clone();
     let rh = exec_ctx.resp_handler.clone();
     match persist_if_needed(payload, ctx, tool_search_metadata, ch, rh).await {
@@ -210,6 +300,7 @@ async fn completed_stream_chunk(
             chunk
         }
         Err(e) => {
+            failure_context.log_error("downstream_persistence_error", &e);
             execution.failed(&e);
             GatewayStreamAccumulator::executor_error_chunk_at(&e, next_sequence_number)
         }
@@ -237,6 +328,9 @@ impl From<&RequestContext> for StreamFailureContext {
 }
 
 impl StreamFailureContext {
+    fn log_error(&self, phase: &str, error: &ExecutorError) {
+        crate::executor::diagnostics::log_error(&self.response_id, &self.model, phase, None, error);
+    }
     pub(super) fn failed_payload(&self, error: &ExecutorError) -> ResponsePayload {
         ResponsePayload {
             id: self.response_id.clone(),
@@ -282,4 +376,65 @@ pub(super) fn panicked_stream_chunks(
     chunks.push(stream_task_failure_chunk(error, *next_sequence_number));
     chunks.push(DONE_MARKER.to_owned());
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::modes::{ConversationHandler, ResponseHandler};
+    use crate::storage::{ConversationStore, ResponseStore};
+    use tokio::sync::oneshot;
+
+    struct NotifyDrop(Option<oneshot::Sender<()>>);
+    impl Drop for NotifyDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_stream_aborts_bootstrapped_worker() {
+        let (mut gate, mut waiter) = initial_stream_commit_gate();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let worker = AbortOnDrop::new(tokio::spawn(async move {
+            let _notify = NotifyDrop(Some(dropped_tx));
+            gate.ready_and_wait().await.unwrap();
+            std::future::pending::<StreamRunResult>().await
+        }));
+        waiter.wait_ready().await.unwrap();
+        assert!(!worker.is_finished());
+        let (_sender, receiver) = mpsc::channel(STREAM_EVENT_BUFFER);
+        let exec_ctx = Arc::new(ExecutionContext::new(
+            ConversationHandler::new(ConversationStore::disabled()),
+            ResponseHandler::new(ResponseStore::disabled()),
+            Arc::new(reqwest::Client::new()),
+            "http://127.0.0.1:1".to_owned(),
+        ));
+        let failure_context = StreamFailureContext {
+            response_id: "resp_cancelled".into(),
+            conversation_id: None,
+            model: "test-model".into(),
+            previous_response_id: None,
+            instructions: None,
+        };
+        let stream = stream_from_worker(
+            worker,
+            receiver,
+            exec_ctx,
+            failure_context,
+            waiter,
+            ExecutionSpan::start(
+                crate::executor::telemetry::Api::Responses,
+                crate::executor::telemetry::Route::Executor,
+                true,
+            ),
+        );
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("unpolled stream drop must abort the worker")
+            .unwrap();
+    }
 }

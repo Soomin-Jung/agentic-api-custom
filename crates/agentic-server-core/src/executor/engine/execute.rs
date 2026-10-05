@@ -8,7 +8,7 @@ use either::Either;
 use tracing::{Instrument as _, debug};
 
 use super::run_blocking;
-use super::streaming::run_stream;
+use super::streaming::prepare_stream;
 use crate::executor::error::ExecutorResult;
 use crate::executor::inference::BoxStream;
 use crate::executor::prepare::prepare_request_tools;
@@ -148,14 +148,17 @@ impl ExecuteRequest {
             }
         };
         if ctx.original_request.stream {
-            return Ok(Either::Right(run_stream(
-                ctx,
-                tool_search_state,
-                self.exec_ctx,
-                self.client_auth,
-                max_stream_event_bytes,
-                execution,
-            )));
+            return Ok(Either::Right(
+                prepare_stream(
+                    ctx,
+                    tool_search_state,
+                    self.exec_ctx,
+                    self.client_auth,
+                    max_stream_event_bytes,
+                    execution,
+                )
+                .await?,
+            ));
         }
         let result = Box::pin(run_blocking(
             ctx,

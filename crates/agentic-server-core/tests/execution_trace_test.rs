@@ -380,7 +380,7 @@ async fn dropping_a_stream_mid_way_is_cancelled_and_disconnected() {
 }
 
 #[tokio::test]
-async fn upstream_failure_in_a_stream_is_a_delivered_failure() {
+async fn upstream_failure_before_stream_exposure_is_not_delivered_by_core() {
     let traces = Traces::new();
     let fixture = TestFixture::new_with_responses(vec![MockResponse::Status(
         502,
@@ -389,18 +389,13 @@ async fn upstream_failure_in_a_stream_is_a_delivered_failure() {
     .await;
 
     let result = run(&traces, Arc::clone(&fixture.exec_ctx), request(true)).await;
-    let Either::Right(stream) = result.unwrap() else {
-        panic!("streaming request returns a stream");
+    let Err(error) = result else {
+        panic!("initial upstream rejection must not expose a stream")
     };
-    let frames = collect_frames(&traces, stream).await;
-    assert!(
-        frames.iter().any(|frame| frame.starts_with("event: error")),
-        "the failure is delivered as an SSE error frame: {frames:?}"
-    );
-    assert_eq!(frames.last().map(String::as_str), Some("data: [DONE]\n\n"));
+    assert_eq!(error.http_status().as_u16(), 502);
 
     let span = traces.execute_span().await;
-    assert_execute_attributes(&span, true, "failed", "delivered");
+    assert_execute_attributes(&span, true, "failed", "not_started");
     assert_eq!(attribute(&span, "error.type"), Some(&Value::from("upstream_status")));
     assert!(matches!(span.status, Status::Error { .. }));
     for kv in &span.attributes {
@@ -433,6 +428,31 @@ async fn failure_before_execution_starts_is_not_delivered() {
         traces.root_span_id(),
         "a child of the enclosing span"
     );
+}
+
+#[tokio::test]
+async fn body_failure_after_stream_exposure_is_a_delivered_failure() {
+    let traces = Traces::new();
+    let fixture = TestFixture::new_with_responses(vec![MockResponse::Sse(
+        "data: {\"type\":\"error\",\"error\":{\"message\":\"upstream secret detail\"}}\n\n".to_owned(),
+    )])
+    .await;
+    let Either::Right(stream) = run(&traces, Arc::clone(&fixture.exec_ctx), request(true))
+        .await
+        .unwrap()
+    else {
+        panic!("accepted upstream status exposes a stream");
+    };
+    let frames = collect_frames(&traces, stream).await;
+    assert!(
+        frames.iter().any(|frame| frame.starts_with("event: error")),
+        "{frames:?}"
+    );
+    assert_eq!(frames.last().map(String::as_str), Some("data: [DONE]\n\n"));
+    let span = traces.execute_span().await;
+    assert_execute_attributes(&span, true, "failed", "delivered");
+    assert_eq!(attribute(&span, "error.type"), Some(&Value::from("stream")));
+    assert!(matches!(span.status, Status::Error { .. }));
 }
 
 // ---------------------------------------------------------------------------

@@ -21,11 +21,13 @@ pub mod session;
 pub mod telemetry;
 pub mod translate;
 
+pub(crate) mod diagnostics;
 mod gateway;
 pub mod gateway_accumulator;
 mod pending_calls;
 mod pipeline;
 mod response_budget;
+mod stream_commit;
 mod upstream;
 
 pub use compaction::compact_response;

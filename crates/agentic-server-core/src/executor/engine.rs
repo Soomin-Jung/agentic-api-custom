@@ -65,6 +65,9 @@ async fn run_until_gateway_tools_complete(
     if agent.request.original_request.input.has_compaction_trigger() {
         let tool_search_metadata = agent.take_tool_search_metadata();
         let payload = run_compaction_trigger(&mut agent.request, exec_ctx, auth).await?;
+        if let Some(mut gate) = agent.initial_commit_gate.take() {
+            gate.ready_and_wait().await?;
+        }
         if let (_, Some((stream_accumulator, stream_sender))) = agent.parts_mut() {
             emit_response_start_events(&payload, stream_accumulator, stream_sender).await?;
             let event_plans = compaction_event_plans(&payload.output, 0);
@@ -123,10 +126,17 @@ impl<'a> EngineOrchestration<'a> {
                 coordinator,
                 pipeline,
                 exec_ctx,
-            } => coordinator
-                .run(pipeline, exec_ctx, auth)
-                .await
-                .map(|payload| (payload, None)),
+            } => {
+                // A tree has multiple independently scheduled upstream calls.
+                // Retain 0.9.0's in-band contract after coordinator admission.
+                if let Some(mut gate) = pipeline.initial_commit_gate.take() {
+                    gate.ready_and_wait().await?;
+                }
+                coordinator
+                    .run(pipeline, exec_ctx, auth)
+                    .await
+                    .map(|payload| (payload, None))
+            }
         }
     }
 }

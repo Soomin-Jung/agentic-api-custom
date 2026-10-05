@@ -12,6 +12,8 @@ use tracing::warn;
 use crate::config::Config;
 use crate::error::Error;
 
+mod diagnostics;
+
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -286,6 +288,13 @@ pub async fn proxy_request_with_path(
     auth: ProxyAuth,
     state: &ProxyState,
 ) -> ProxyResponse {
+    let response_model = if path == "/v1/responses" {
+        serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned))
+    } else {
+        None
+    };
     let is_streaming = request.is_streaming();
 
     let llm_headers = upstream_request_headers(&request.headers, &state.config, auth);
@@ -323,10 +332,18 @@ pub async fn proxy_request_with_path(
 
         let byte_stream = llm_resp.bytes_stream().map_err(std::io::Error::other);
 
+        let body = if let Some(model) = response_model {
+            ProxyBody::Stream(Box::pin(diagnostics::observe_response_stream(
+                byte_stream,
+                diagnostics::ResponseStreamObserver::new(model, status.as_u16()),
+            )))
+        } else {
+            ProxyBody::Stream(Box::pin(byte_stream))
+        };
         return ProxyResponse {
             status,
             headers: response_headers,
-            body: ProxyBody::Stream(Box::pin(byte_stream)),
+            body,
         };
     }
 

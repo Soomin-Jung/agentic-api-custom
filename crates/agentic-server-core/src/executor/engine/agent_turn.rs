@@ -238,6 +238,7 @@ impl<'a> AgentTurn<'a> {
         response_budget: &ExecutorResponseBudget,
     ) -> ExecutorResult<RoundResult> {
         let round = self.next_round;
+        self.pipeline.inference_round = Some(round);
         if round >= self.max_rounds.get() {
             return Err(ExecutorError::StreamError(
                 "agent turn exceeded its inference-round limit".into(),
