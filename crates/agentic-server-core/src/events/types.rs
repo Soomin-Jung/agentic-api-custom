@@ -1,100 +1,10 @@
+mod item;
+pub use item::SSEItemType;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::types::io::{OutputItem, ResponseUsage};
-
-/// The type of an output item received during streaming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SSEItemType {
-    Reasoning,
-    FunctionCall,
-    ToolSearchCall,
-    CustomToolCall,
-    WebSearchCall,
-    McpCall,
-    McpListTools,
-    Compaction,
-    Message,
-}
-
-impl SSEItemType {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Reasoning => "reasoning",
-            Self::FunctionCall => "function_call",
-            Self::ToolSearchCall => "tool_search_call",
-            Self::CustomToolCall => "custom_tool_call",
-            Self::WebSearchCall => "web_search_call",
-            Self::McpCall => "mcp_call",
-            Self::McpListTools => "mcp_list_tools",
-            Self::Compaction => "compaction",
-            Self::Message => "message",
-        }
-    }
-}
-
-impl From<&str> for SSEItemType {
-    fn from(s: &str) -> Self {
-        s.parse().unwrap_or(Self::Message)
-    }
-}
-
-impl std::str::FromStr for SSEItemType {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "reasoning" => Ok(Self::Reasoning),
-            "function_call" => Ok(Self::FunctionCall),
-            "tool_search_call" => Ok(Self::ToolSearchCall),
-            "custom_tool_call" => Ok(Self::CustomToolCall),
-            "web_search_call" => Ok(Self::WebSearchCall),
-            "mcp_call" => Ok(Self::McpCall),
-            "mcp_list_tools" => Ok(Self::McpListTools),
-            "compaction" => Ok(Self::Compaction),
-            "message" => Ok(Self::Message),
-            _ => Err(()),
-        }
-    }
-}
-
-impl TryFrom<&OutputItem> for SSEItemType {
-    type Error = ();
-
-    fn try_from(item: &OutputItem) -> Result<Self, Self::Error> {
-        match item {
-            OutputItem::Message(_) => Ok(Self::Message),
-            OutputItem::FunctionCall(_) => Ok(Self::FunctionCall),
-            OutputItem::ToolSearchCall(_) => Ok(Self::ToolSearchCall),
-            OutputItem::CustomToolCall(_) => Ok(Self::CustomToolCall),
-            OutputItem::WebSearchCall(_) => Ok(Self::WebSearchCall),
-            OutputItem::McpCall(_) => Ok(Self::McpCall),
-            OutputItem::McpListTools(_) => Ok(Self::McpListTools),
-            OutputItem::Reasoning(_) => Ok(Self::Reasoning),
-            OutputItem::Compaction(_) => Ok(Self::Compaction),
-            OutputItem::Unknown => Err(()),
-        }
-    }
-}
-
-impl From<String> for SSEItemType {
-    fn from(s: String) -> Self {
-        Self::from(s.as_str())
-    }
-}
-
-impl PartialEq<str> for SSEItemType {
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-
-impl PartialEq<&str> for SSEItemType {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
+use crate::types::io::{AgentAttribution, AgentMessageContent, OutputItem, ResponseUsage};
 
 /// Classification of SSE event types from the Responses API.
 ///
@@ -109,6 +19,8 @@ pub enum SSEEventType {
     ResponseCompleted,
     ResponseFailed,
     ResponseIncomplete,
+    /// Response-level liveness, with no output-item or agent lifecycle transition.
+    Keepalive,
 
     // Output item lifecycle
     OutputItemAdded,
@@ -125,6 +37,9 @@ pub enum SSEEventType {
     FunctionCallArgumentsDone,
     CustomToolCallInputDelta,
     CustomToolCallInputDone,
+    ShellCallCommandAdded,
+    ShellCallCommandDelta,
+    ShellCallCommandDone,
 
     // Reasoning
     ReasoningTextDelta,
@@ -140,6 +55,11 @@ pub enum SSEEventType {
     WebSearchCallInProgress,
     WebSearchCallSearching,
     WebSearchCallCompleted,
+    CodeInterpreterCallInProgress,
+    CodeInterpreterCallCodeDelta,
+    CodeInterpreterCallCodeDone,
+    CodeInterpreterCallInterpreting,
+    CodeInterpreterCallCompleted,
     McpCallInProgress,
     McpCallArgumentsDelta,
     McpCallArgumentsDone,
@@ -161,6 +81,7 @@ impl From<&str> for SSEEventType {
             "response.completed" | "response.done" => Self::ResponseCompleted,
             "response.failed" => Self::ResponseFailed,
             "response.incomplete" => Self::ResponseIncomplete,
+            "keepalive" => Self::Keepalive,
             "response.output_item.added" => Self::OutputItemAdded,
             "response.output_item.done" => Self::OutputItemDone,
             "response.output_text.delta" => Self::OutputTextDelta,
@@ -171,6 +92,9 @@ impl From<&str> for SSEEventType {
             "response.function_call_arguments.done" => Self::FunctionCallArgumentsDone,
             "response.custom_tool_call_input.delta" => Self::CustomToolCallInputDelta,
             "response.custom_tool_call_input.done" => Self::CustomToolCallInputDone,
+            "response.shell_call_command.added" => Self::ShellCallCommandAdded,
+            "response.shell_call_command.delta" => Self::ShellCallCommandDelta,
+            "response.shell_call_command.done" => Self::ShellCallCommandDone,
             "response.reasoning_text.delta" => Self::ReasoningTextDelta,
             "response.reasoning_text.done" => Self::ReasoningTextDone,
             "response.reasoning_part.added" => Self::ReasoningPartAdded,
@@ -182,6 +106,11 @@ impl From<&str> for SSEEventType {
             "response.web_search_call.in_progress" => Self::WebSearchCallInProgress,
             "response.web_search_call.searching" => Self::WebSearchCallSearching,
             "response.web_search_call.completed" => Self::WebSearchCallCompleted,
+            "response.code_interpreter_call.in_progress" => Self::CodeInterpreterCallInProgress,
+            "response.code_interpreter_call_code.delta" => Self::CodeInterpreterCallCodeDelta,
+            "response.code_interpreter_call_code.done" => Self::CodeInterpreterCallCodeDone,
+            "response.code_interpreter_call.interpreting" => Self::CodeInterpreterCallInterpreting,
+            "response.code_interpreter_call.completed" => Self::CodeInterpreterCallCompleted,
             "response.mcp_call.in_progress" => SSEEventType::McpCallInProgress,
             "response.mcp_call_arguments.delta" => SSEEventType::McpCallArgumentsDelta,
             "response.mcp_call_arguments.done" => SSEEventType::McpCallArgumentsDone,
@@ -205,6 +134,7 @@ impl TryFrom<SSEEventType> for &'static str {
             SSEEventType::ResponseCompleted => Ok("response.completed"),
             SSEEventType::ResponseFailed => Ok("response.failed"),
             SSEEventType::ResponseIncomplete => Ok("response.incomplete"),
+            SSEEventType::Keepalive => Ok("keepalive"),
             SSEEventType::OutputItemAdded => Ok("response.output_item.added"),
             SSEEventType::OutputItemDone => Ok("response.output_item.done"),
             SSEEventType::OutputTextDelta => Ok("response.output_text.delta"),
@@ -215,6 +145,9 @@ impl TryFrom<SSEEventType> for &'static str {
             SSEEventType::FunctionCallArgumentsDone => Ok("response.function_call_arguments.done"),
             SSEEventType::CustomToolCallInputDelta => Ok("response.custom_tool_call_input.delta"),
             SSEEventType::CustomToolCallInputDone => Ok("response.custom_tool_call_input.done"),
+            SSEEventType::ShellCallCommandAdded => Ok("response.shell_call_command.added"),
+            SSEEventType::ShellCallCommandDelta => Ok("response.shell_call_command.delta"),
+            SSEEventType::ShellCallCommandDone => Ok("response.shell_call_command.done"),
             SSEEventType::ReasoningTextDelta => Ok("response.reasoning_text.delta"),
             SSEEventType::ReasoningTextDone => Ok("response.reasoning_text.done"),
             SSEEventType::ReasoningPartAdded => Ok("response.reasoning_part.added"),
@@ -226,6 +159,11 @@ impl TryFrom<SSEEventType> for &'static str {
             SSEEventType::WebSearchCallInProgress => Ok("response.web_search_call.in_progress"),
             SSEEventType::WebSearchCallSearching => Ok("response.web_search_call.searching"),
             SSEEventType::WebSearchCallCompleted => Ok("response.web_search_call.completed"),
+            SSEEventType::CodeInterpreterCallInProgress => Ok("response.code_interpreter_call.in_progress"),
+            SSEEventType::CodeInterpreterCallCodeDelta => Ok("response.code_interpreter_call_code.delta"),
+            SSEEventType::CodeInterpreterCallCodeDone => Ok("response.code_interpreter_call_code.done"),
+            SSEEventType::CodeInterpreterCallInterpreting => Ok("response.code_interpreter_call.interpreting"),
+            SSEEventType::CodeInterpreterCallCompleted => Ok("response.code_interpreter_call.completed"),
             SSEEventType::McpCallInProgress => Ok("response.mcp_call.in_progress"),
             SSEEventType::McpCallArgumentsDelta => Ok("response.mcp_call_arguments.delta"),
             SSEEventType::McpCallArgumentsDone => Ok("response.mcp_call_arguments.done"),
@@ -243,12 +181,29 @@ impl TryFrom<SSEEventType> for &'static str {
 pub struct WireEvent {
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub event_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_sequence_number",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub sequence_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_index: Option<u64>,
+    /// Event attribution is independent of attribution on an embedded output item.
+    /// Omission never implies `/root` and must not fill in missing item attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentAttribution>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
+}
+
+// Some upstreams use negative integer sentinels for an unspecified sequence.
+// Preserve the full u64 range; client numbering belongs to the stream relay.
+fn deserialize_sequence_number<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i128>::deserialize(deserializer).map(|value| value.and_then(|number| u64::try_from(number).ok()))
 }
 
 impl WireEvent {
@@ -258,9 +213,18 @@ impl WireEvent {
             event_type: Some(event_type.into()),
             sequence_number: None,
             output_index: None,
+            agent: None,
             rest: Map::new(),
         }
     }
+}
+
+/// One command's incremental lifecycle within a shell output item.
+#[derive(Debug, Clone)]
+pub enum ShellCommandUpdate {
+    Added(String),
+    Delta(String),
+    Done(String),
 }
 
 /// Typed payload extracted from an SSE event's JSON data.
@@ -279,25 +243,37 @@ pub enum EventPayload {
     OutputItemAdded {
         item_id: String,
         item_type: SSEItemType,
-        output_index: u32,
+        output_index: Option<u32>,
         name: Option<String>,
         namespace: Option<String>,
         call_id: Option<String>,
+        /// Initial snapshot for message, shell, and collaboration items, whose fields are
+        /// needed before their incremental or completion events arrive.
+        initial_item: Option<Box<OutputItem>>,
     },
 
     /// `response.output_item.done`
     OutputItemDone {
         item_id: String,
         item_type: SSEItemType,
-        output_index: u32,
+        output_index: Option<u32>,
         item: Value,
+    },
+
+    /// A completed content part. The accumulator resolves its owning message or
+    /// `agent_message` by output index and item ID, not by the content part's type.
+    ContentPartDone {
+        item_id: String,
+        output_index: Option<u32>,
+        content_index: u32,
+        part: AgentMessageContent,
     },
 
     /// `response.output_text.delta`
     TextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -305,7 +281,8 @@ pub enum EventPayload {
     TextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
+        content_index: u32,
     },
 
     /// `response.function_call_arguments.delta`
@@ -313,7 +290,7 @@ pub enum EventPayload {
         delta: String,
         call_id: Option<String>,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.function_call_arguments.done`
@@ -322,28 +299,34 @@ pub enum EventPayload {
         call_id: Option<String>,
         item_id: String,
         name: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.custom_tool_call_input.delta`
+    ShellCallCommand {
+        item_id: String,
+        output_index: u32,
+        command_index: u32,
+        update: ShellCommandUpdate,
+    },
     CustomToolCallInputDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.custom_tool_call_input.done`
     CustomToolCallInputDone {
         input: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
     },
 
     /// `response.reasoning_text.delta`
     ReasoningTextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -351,7 +334,7 @@ pub enum EventPayload {
     ReasoningTextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         content_index: u32,
     },
 
@@ -359,7 +342,7 @@ pub enum EventPayload {
     ReasoningSummaryTextDelta {
         delta: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         summary_index: u32,
     },
 
@@ -367,7 +350,7 @@ pub enum EventPayload {
     ReasoningSummaryTextDone {
         text: String,
         item_id: String,
-        output_index: u32,
+        output_index: Option<u32>,
         summary_index: u32,
     },
 
@@ -389,16 +372,89 @@ pub struct EventFrame {
 }
 
 impl EventFrame {
+    /// The supplied item index, retaining absence until ingestion resolves it.
+    pub(crate) fn output_index(&self) -> Option<u32> {
+        match &self.payload {
+            EventPayload::OutputItemAdded { output_index, .. }
+            | EventPayload::OutputItemDone { output_index, .. }
+            | EventPayload::ContentPartDone { output_index, .. }
+            | EventPayload::TextDelta { output_index, .. }
+            | EventPayload::TextDone { output_index, .. }
+            | EventPayload::FunctionCallArgsDelta { output_index, .. }
+            | EventPayload::FunctionCallArgsDone { output_index, .. }
+            | EventPayload::CustomToolCallInputDelta { output_index, .. }
+            | EventPayload::CustomToolCallInputDone { output_index, .. }
+            | EventPayload::ReasoningTextDelta { output_index, .. }
+            | EventPayload::ReasoningTextDone { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDelta { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDone { output_index, .. } => *output_index,
+            _ => self.wire.output_index.and_then(|index| u32::try_from(index).ok()),
+        }
+    }
+
+    /// Carries the ingestion-resolved index into folding and emitted wire data.
+    pub(crate) fn set_output_index(&mut self, index: u32) {
+        self.wire.output_index = Some(u64::from(index));
+        match &mut self.payload {
+            EventPayload::OutputItemAdded { output_index, .. }
+            | EventPayload::OutputItemDone { output_index, .. }
+            | EventPayload::ContentPartDone { output_index, .. }
+            | EventPayload::TextDelta { output_index, .. }
+            | EventPayload::TextDone { output_index, .. }
+            | EventPayload::FunctionCallArgsDelta { output_index, .. }
+            | EventPayload::FunctionCallArgsDone { output_index, .. }
+            | EventPayload::CustomToolCallInputDelta { output_index, .. }
+            | EventPayload::CustomToolCallInputDone { output_index, .. }
+            | EventPayload::ReasoningTextDelta { output_index, .. }
+            | EventPayload::ReasoningTextDone { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDelta { output_index, .. }
+            | EventPayload::ReasoningSummaryTextDone { output_index, .. } => *output_index = Some(index),
+            EventPayload::Raw(value) => {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("output_index".to_owned(), Value::from(index));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps a completed item's typed and wire IDs aligned after ingestion backfills one.
+    pub(crate) fn set_done_item_id(&mut self, id: &str) {
+        let (EventPayload::OutputItemDone { item_id, item, .. }, Some(wire_item)) =
+            (&mut self.payload, self.wire.rest.get_mut("item"))
+        else {
+            return;
+        };
+        let (Some(item), Some(wire_item)) = (item.as_object_mut(), wire_item.as_object_mut()) else {
+            return;
+        };
+        item_id.clear();
+        item_id.push_str(id);
+        item.insert("id".to_owned(), Value::String(id.to_owned()));
+        wire_item.insert("id".to_owned(), Value::String(id.to_owned()));
+    }
+
     #[must_use]
-    pub fn synthetic(event_type: SSEEventType, rest: Map<String, Value>) -> Option<Self> {
+    pub fn synthetic(event_type: SSEEventType, mut rest: Map<String, Value>) -> Option<Self> {
         let event_type_name = <&str>::try_from(event_type).ok()?;
+        // Keep one representation of attribution even when a synthetic caller supplies
+        // it with the other wire fields. Invalid attribution cannot become an unowned event.
+        let agent: Option<AgentAttribution> = match rest.remove("agent") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value).ok()?),
+        };
+        let output_index = match rest.remove("output_index") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64()?),
+        };
         Some(Self {
             event_type,
             payload: EventPayload::None,
             wire: WireEvent {
                 event_type: Some(event_type_name.to_owned()),
                 sequence_number: None,
-                output_index: None,
+                output_index,
+                agent,
                 rest,
             },
         })
@@ -425,6 +481,7 @@ mod tests {
     #[test]
     fn sse_item_type_is_derived_from_typed_output_items() {
         let item = OutputItem::FunctionCall(FunctionToolCall {
+            agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),
             name: "lookup".to_owned(),
@@ -445,6 +502,7 @@ mod tests {
             SSEEventType::ResponseCompleted,
             SSEEventType::ResponseFailed,
             SSEEventType::ResponseIncomplete,
+            SSEEventType::Keepalive,
             SSEEventType::OutputItemAdded,
             SSEEventType::OutputItemDone,
             SSEEventType::OutputTextDelta,
@@ -455,6 +513,9 @@ mod tests {
             SSEEventType::FunctionCallArgumentsDone,
             SSEEventType::CustomToolCallInputDelta,
             SSEEventType::CustomToolCallInputDone,
+            SSEEventType::ShellCallCommandAdded,
+            SSEEventType::ShellCallCommandDelta,
+            SSEEventType::ShellCallCommandDone,
             SSEEventType::ReasoningTextDelta,
             SSEEventType::ReasoningTextDone,
             SSEEventType::ReasoningPartAdded,
@@ -466,6 +527,11 @@ mod tests {
             SSEEventType::WebSearchCallInProgress,
             SSEEventType::WebSearchCallSearching,
             SSEEventType::WebSearchCallCompleted,
+            SSEEventType::CodeInterpreterCallInProgress,
+            SSEEventType::CodeInterpreterCallCodeDelta,
+            SSEEventType::CodeInterpreterCallCodeDone,
+            SSEEventType::CodeInterpreterCallInterpreting,
+            SSEEventType::CodeInterpreterCallCompleted,
             SSEEventType::McpCallInProgress,
             SSEEventType::McpCallArgumentsDelta,
             SSEEventType::McpCallArgumentsDone,

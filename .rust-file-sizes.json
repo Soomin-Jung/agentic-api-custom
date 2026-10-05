@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "baseline": {
+    "crates/agentic-server-core/src/executor/gateway.rs": 580,
+    "crates/agentic-server-core/src/tool/registry.rs": 515,
+    "crates/agentic-server-core/src/tool/tool_search.rs": 1661,
+    "crates/agentic-server-core/src/types/io/output.rs": 932,
+    "crates/agentic-server/src/agentic_process.rs": 552,
+    "crates/agentic-server/src/auth.rs": 791,
+    "crates/agentic-server/src/handler/websocket/responses.rs": 784
+  },
+  "exceptions": {
+    "crates/agentic-server-core/src/config.rs": {
+      "limit": 629,
+      "reason": "Operator-owned code-interpreter worker limits and admission validation share runtime configuration with the Tavily web-search provider settings."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/active.rs": {
+      "limit": 512,
+      "reason": "Code-interpreter call state shares the typed item lifecycle dispatcher with multi-agent call and agent-message states."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/mod.rs": {
+      "limit": 641,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server-core/src/executor/accumulator/slot.rs": {
+      "limit": 518,
+      "reason": "Code-interpreter done-only ID backfill remains in the shared output-item slot validation path."
+    },
+    "crates/agentic-server-core/src/executor/gateway.rs": {
+      "limit": 696,
+      "reason": "Gateway-owned code-interpreter calls emit their public SSE lifecycle through the existing scheduler after policy extraction."
+    },
+    "crates/agentic-server-core/src/executor/response_budget.rs": {
+      "limit": 505,
+      "reason": "Code-interpreter outputs and optional agent attribution are charged in the shared retained-item budget."
+    },
+    "crates/agentic-server-core/src/tool/registry.rs": {
+      "limit": 528,
+      "reason": "The code interpreter follows the existing registry validation and executor registration flow."
+    },
+    "crates/agentic-server-core/src/tool/tool_search.rs": {
+      "limit": 1681,
+      "reason": "Code-interpreter continuation items pass through tool-search history without changing discovery state."
+    },
+    "crates/agentic-server-core/src/types/io/input.rs": {
+      "limit": 514,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server-core/src/types/io/output.rs": {
+      "limit": 1087,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server-core/src/types/tools/params.rs": {
+      "limit": 576,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server/src/main.rs": {
+      "limit": 643,
+      "reason": "Server configuration applies documented file and environment precedence to code-interpreter worker memory and guest resource limits."
+    },
+    "crates/agentic-server-core/src/executor/session.rs": {
+      "limit": 508,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server/src/agentic_process.rs": {
+      "limit": 557,
+      "reason": "Bounded import of official v0.9.0 (8038abf) relative to the older fork main; retain the prior baseline allowance."
+    },
+    "crates/agentic-server/src/handler/websocket/responses.rs": {
+      "limit": 785,
+      "reason": "Preserve upstream 0.9.0 tracing and check shutdown admission before eager Responses bootstrap so accepted execution drains."
+    }
+  },
+  "generated": {}
+}

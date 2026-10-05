@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::{EventFrame, SSEEventType, SSEItemType};
+use super::{EventFrame, EventPayload, SSEEventType, SSEItemType};
 use crate::types::io::OutputItem;
 
 #[derive(Debug, Error)]
@@ -18,7 +18,8 @@ pub(crate) struct ValidatedFrame<'a> {
 pub(crate) struct ValidatedItem<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) output_index: u32,
-    pub(crate) item_type: SSEItemType,
+    /// None for shared content events whose owner is resolved by the accumulator.
+    pub(crate) item_type: Option<SSEItemType>,
     pub(crate) done_item: Option<OutputItem>,
 }
 
@@ -46,16 +47,27 @@ pub(crate) fn validate_frame(frame: &EventFrame) -> Result<ValidatedFrame<'_>, E
         SSEEventType::OutputItemDone => {
             validate_output_item(frame, event_name, true).map(|item| ValidatedFrame { item: Some(item) })
         }
-        SSEEventType::Other => Ok(ValidatedFrame { item: None }),
+        SSEEventType::Keepalive | SSEEventType::Other => Ok(ValidatedFrame { item: None }),
         event_type => {
             let output_index = required_output_index(frame, event_name)?;
-            let item_id = required_str(&frame.wire.rest, "item_id", event_name)?;
+            let item_id = validate_event_item_id(frame, event_name)?;
             validate_event_fields(&frame.wire.rest, event_type, event_name)?;
-            let item_type = expected_item_type(event_type).ok_or_else(|| {
-                invalid(format!(
+            if event_type == SSEEventType::ContentPartDone
+                && !matches!(frame.payload, EventPayload::ContentPartDone { .. })
+            {
+                return Err(invalid("invalid completed content part"));
+            }
+            let item_type = expected_item_type(frame);
+            if item_type.is_none()
+                && !matches!(
+                    event_type,
+                    SSEEventType::ContentPartAdded | SSEEventType::ContentPartDone
+                )
+            {
+                return Err(invalid(format!(
                     "upstream output item type for event '{event_name}' is unsupported"
-                ))
-            })?;
+                )));
+            }
             Ok(ValidatedFrame {
                 item: Some(ValidatedItem {
                     item_id,
@@ -68,18 +80,18 @@ pub(crate) fn validate_frame(frame: &EventFrame) -> Result<ValidatedFrame<'_>, E
     }
 }
 
-fn expected_item_type(event_type: SSEEventType) -> Option<SSEItemType> {
-    match event_type {
-        SSEEventType::OutputTextDelta
-        | SSEEventType::OutputTextDone
-        | SSEEventType::ContentPartAdded
-        | SSEEventType::ContentPartDone => Some(SSEItemType::Message),
+pub(crate) fn expected_item_type(frame: &EventFrame) -> Option<SSEItemType> {
+    match frame.event_type {
+        SSEEventType::OutputTextDelta | SSEEventType::OutputTextDone => Some(SSEItemType::Message),
         SSEEventType::FunctionCallArgumentsDelta | SSEEventType::FunctionCallArgumentsDone => {
             Some(SSEItemType::FunctionCall)
         }
         SSEEventType::CustomToolCallInputDelta | SSEEventType::CustomToolCallInputDone => {
             Some(SSEItemType::CustomToolCall)
         }
+        SSEEventType::ShellCallCommandAdded
+        | SSEEventType::ShellCallCommandDelta
+        | SSEEventType::ShellCallCommandDone => Some(SSEItemType::ShellCall),
         SSEEventType::ReasoningTextDelta
         | SSEEventType::ReasoningTextDone
         | SSEEventType::ReasoningPartAdded
@@ -89,6 +101,11 @@ fn expected_item_type(event_type: SSEEventType) -> Option<SSEItemType> {
         SSEEventType::WebSearchCallInProgress
         | SSEEventType::WebSearchCallSearching
         | SSEEventType::WebSearchCallCompleted => Some(SSEItemType::WebSearchCall),
+        SSEEventType::CodeInterpreterCallInProgress
+        | SSEEventType::CodeInterpreterCallCodeDelta
+        | SSEEventType::CodeInterpreterCallCodeDone
+        | SSEEventType::CodeInterpreterCallInterpreting
+        | SSEEventType::CodeInterpreterCallCompleted => Some(SSEItemType::CodeInterpreterCall),
         SSEEventType::McpCallInProgress
         | SSEEventType::McpCallArgumentsDelta
         | SSEEventType::McpCallArgumentsDone
@@ -97,7 +114,9 @@ fn expected_item_type(event_type: SSEEventType) -> Option<SSEItemType> {
         SSEEventType::McpListToolsInProgress
         | SSEEventType::McpListToolsCompleted
         | SSEEventType::McpListToolsFailed => Some(SSEItemType::McpListTools),
-        SSEEventType::ResponseCreated
+        SSEEventType::ContentPartAdded
+        | SSEEventType::ContentPartDone
+        | SSEEventType::ResponseCreated
         | SSEEventType::ResponseInProgress
         | SSEEventType::ResponseCompleted
         | SSEEventType::ResponseFailed
@@ -106,6 +125,7 @@ fn expected_item_type(event_type: SSEEventType) -> Option<SSEItemType> {
         | SSEEventType::OutputItemDone
         | SSEEventType::FileSearchCallSearching
         | SSEEventType::FileSearchCallCompleted
+        | SSEEventType::Keepalive
         | SSEEventType::Other => None,
     }
 }
@@ -164,10 +184,21 @@ fn validate_output_item<'a>(
     let item = required_object(&frame.wire.rest, "item", event_name)?;
     let (item_id, item_type) = output_item_identity(item, "output item")?;
     if !complete {
+        if item_type.is_collaboration()
+            && !matches!(
+                &frame.payload,
+                EventPayload::OutputItemAdded {
+                    initial_item: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(invalid("collaboration item has an invalid opening snapshot"));
+        }
         return Ok(ValidatedItem {
             item_id,
             output_index,
-            item_type,
+            item_type: Some(item_type),
             done_item: None,
         });
     }
@@ -187,9 +218,22 @@ fn validate_output_item<'a>(
     Ok(ValidatedItem {
         item_id,
         output_index,
-        item_type,
+        item_type: Some(item_type),
         done_item: Some(output),
     })
+}
+
+fn validate_event_item_id<'a>(frame: &'a EventFrame, event_name: &str) -> Result<&'a str, EventError> {
+    if matches!(
+        frame.event_type,
+        SSEEventType::ShellCallCommandAdded | SSEEventType::ShellCallCommandDelta | SSEEventType::ShellCallCommandDone
+    ) && !frame.wire.rest.contains_key("item_id")
+    {
+        // Only native shell command events may omit the ID and resolve by output_index.
+        return Ok("");
+    }
+    let item_id = required_str(&frame.wire.rest, "item_id", event_name)?;
+    Ok(item_id)
 }
 
 fn validate_event_fields(
@@ -198,6 +242,11 @@ fn validate_event_fields(
     event_name: &str,
 ) -> Result<(), EventError> {
     match event_type {
+        SSEEventType::ShellCallCommandAdded
+        | SSEEventType::ShellCallCommandDelta
+        | SSEEventType::ShellCallCommandDone => {
+            required_u32(event, "command_index", event_name)?;
+        }
         SSEEventType::OutputTextDelta
         | SSEEventType::OutputTextDone
         | SSEEventType::ContentPartAdded
@@ -218,14 +267,18 @@ fn validate_event_fields(
         SSEEventType::OutputTextDelta
         | SSEEventType::FunctionCallArgumentsDelta
         | SSEEventType::CustomToolCallInputDelta
+        | SSEEventType::ShellCallCommandDelta
         | SSEEventType::ReasoningTextDelta
         | SSEEventType::ReasoningSummaryTextDelta
-        | SSEEventType::McpCallArgumentsDelta => Some("delta"),
+        | SSEEventType::McpCallArgumentsDelta
+        | SSEEventType::CodeInterpreterCallCodeDelta => Some("delta"),
         SSEEventType::OutputTextDone | SSEEventType::ReasoningTextDone | SSEEventType::ReasoningSummaryTextDone => {
             Some("text")
         }
         SSEEventType::FunctionCallArgumentsDone | SSEEventType::McpCallArgumentsDone => Some("arguments"),
+        SSEEventType::CodeInterpreterCallCodeDone => Some("code"),
         SSEEventType::CustomToolCallInputDone => Some("input"),
+        SSEEventType::ShellCallCommandAdded | SSEEventType::ShellCallCommandDone => Some("command"),
         SSEEventType::ContentPartAdded
         | SSEEventType::ContentPartDone
         | SSEEventType::ReasoningPartAdded
@@ -245,12 +298,16 @@ fn validate_event_fields(
         | SSEEventType::WebSearchCallInProgress
         | SSEEventType::WebSearchCallSearching
         | SSEEventType::WebSearchCallCompleted
+        | SSEEventType::CodeInterpreterCallInProgress
+        | SSEEventType::CodeInterpreterCallInterpreting
+        | SSEEventType::CodeInterpreterCallCompleted
         | SSEEventType::McpCallInProgress
         | SSEEventType::McpCallCompleted
         | SSEEventType::McpCallFailed
         | SSEEventType::McpListToolsInProgress
         | SSEEventType::McpListToolsCompleted
         | SSEEventType::McpListToolsFailed
+        | SSEEventType::Keepalive
         | SSEEventType::Other => None,
     };
     if let Some(field) = required {
@@ -307,4 +364,49 @@ fn missing_field(owner: &str, field: &str) -> EventError {
 
 fn invalid(message: impl Into<String>) -> EventError {
     EventError(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::validate_frame;
+    use crate::events::normalize_sse_line;
+
+    #[test]
+    fn only_native_shell_command_events_allow_omitted_item_id() {
+        for (event_type, allows_omitted_id) in [
+            ("response.shell_call_command.added", true),
+            ("response.shell_call_command.delta", true),
+            ("response.shell_call_command.done", true),
+            ("response.function_call_arguments.delta", false),
+            ("response.function_call_arguments.done", false),
+            ("response.custom_tool_call_input.delta", false),
+            ("response.custom_tool_call_input.done", false),
+            ("response.mcp_call_arguments.delta", false),
+        ] {
+            let event = json!({
+                "type": event_type,
+                "output_index": 0,
+                "command_index": 0,
+                "command": "pwd",
+                "delta": "",
+                "arguments": "{}",
+                "input": "pwd"
+            });
+            let frame = normalize_sse_line(&format!("data: {event}")).unwrap();
+            assert_eq!(validate_frame(&frame).is_ok(), allows_omitted_id, "{event_type}");
+
+            for item_id in [json!(""), json!(null), json!(42), json!("sh_1")] {
+                let mut event = event.clone();
+                event["item_id"] = item_id.clone();
+                let frame = normalize_sse_line(&format!("data: {event}")).unwrap();
+                assert_eq!(
+                    validate_frame(&frame).is_ok(),
+                    item_id == json!("sh_1"),
+                    "{event_type} with item_id={item_id}"
+                );
+            }
+        }
+    }
 }

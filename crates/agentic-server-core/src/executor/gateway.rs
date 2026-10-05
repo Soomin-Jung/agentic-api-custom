@@ -1,68 +1,27 @@
-use std::future::Future;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+pub(super) mod history;
+mod policy;
+
+pub(super) use history::{append_gateway_calls_to_new_input, append_output_items_to_input, append_tool_outputs};
+pub(crate) use policy::GatewaySchedulerPolicy;
+#[cfg(test)]
+pub(super) use policy::MAX_CONCURRENT_MATERIALIZATIONS;
+
 use std::time::Duration;
 
 use futures::future::join_all;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
-use crate::config::DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS;
-use crate::events::SSEEventType;
+use crate::events::{EventFrame, EventPayload, SSEEventType};
 use crate::executor::error::{ExecutorError, ExecutorResult};
-use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, emit_sse_frame, synthetic_event};
-use crate::executor::request::RequestContext;
+use crate::executor::gateway_accumulator::{GatewayStreamAccumulator, StreamEvent, synthetic_event};
+use crate::executor::pipeline::emit_gateway_event;
 use crate::executor::response_budget::ExecutorResponseBudget;
 use crate::tool::handler::MAX_GATEWAY_TOOL_OUTPUT_BYTES;
 use crate::tool::{GatewayBinding, ToolError, ToolOutput, ToolOwnership, ToolRegistry};
 use crate::types::io::output::{FunctionToolCall, GatewayCallStatus, McpCallStatus};
-use crate::types::io::{InputItem, OutputItem, ResponsesInput};
+use crate::types::io::{CodeInterpreterCallStreamEvent, InputItem, OutputItem};
 use crate::types::request_response::ResponsePayload;
-use crate::utils::common::{serialize_to_string, serialize_to_value};
-
-pub(super) const MAX_CONCURRENT_MATERIALIZATIONS: usize = 16;
-
-/// Request-independent execution policy owned by one [`ExecutionContext`].
-///
-/// The nonzero type prevents a zero-capacity per-request semaphore. Distinct
-/// execution contexts retain their own limits instead of sharing process-global state.
-#[derive(Debug, Clone)]
-pub(crate) struct GatewaySchedulerPolicy {
-    max_concurrent_calls: NonZeroUsize,
-    materialization_permits: Arc<Semaphore>,
-}
-
-impl GatewaySchedulerPolicy {
-    #[must_use]
-    pub(crate) fn new(max_concurrent_calls: NonZeroUsize) -> Self {
-        // Each permit protects one handler whose output is capped at
-        // MAX_GATEWAY_TOOL_OUTPUT_BYTES. The policy is cloned with an
-        // ExecutionContext, so this bound is shared by concurrent requests
-        // (including WebSocket lanes) instead of being recreated per turn.
-        Self {
-            max_concurrent_calls,
-            materialization_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_MATERIALIZATIONS)),
-        }
-    }
-
-    /// Acquires one process-wide materialization slot shared by cloned execution contexts.
-    pub(crate) fn acquire_materialization_permit(
-        &self,
-    ) -> impl Future<Output = OwnedSemaphorePermit> + Send + 'static + use<> {
-        let materialization_permits = Arc::clone(&self.materialization_permits);
-        async move {
-            materialization_permits
-                .acquire_owned()
-                .await
-                .expect("materialization semaphore is never closed")
-        }
-    }
-}
-
-impl Default for GatewaySchedulerPolicy {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_GATEWAY_CALLS)
-    }
-}
+use crate::utils::common::{deserialize_from_value, serialize_to_string, serialize_to_value};
 
 /// Per-call wall-clock budget. A tool exceeding this yields an error output fed
 /// back to the model (never a whole-request failure). `Duration::ZERO` disables
@@ -117,6 +76,7 @@ enum GatewayExecutionPlan {
 /// relationship cannot diverge.
 #[derive(Clone)]
 struct GatewayCallPlan {
+    tool_type: crate::tool::ToolType,
     item_index: usize,
     call: FunctionToolCall,
     execution: GatewayExecutionPlan,
@@ -173,6 +133,7 @@ impl GatewayScheduler {
                         GatewayExecutionPlan::Bound(binding.clone())
                     });
                 Some(GatewayCallPlan {
+                    tool_type: entry.tool_type,
                     item_index,
                     call: call.clone(),
                     execution,
@@ -267,6 +228,9 @@ impl GatewayScheduler {
         Ok(results)
     }
 
+    #[tracing::instrument(name = "agentic.tool.execute", skip_all, fields(
+        agentic.tool.r#type = super::telemetry::stages::tool_type(plan.tool_type)
+    ))]
     async fn run_one(
         &self,
         plan: GatewayCallPlan,
@@ -363,20 +327,27 @@ pub(super) fn public_output_items(
     output_items: &[OutputItem],
     registry: &ToolRegistry,
     gateway_results: &[GatewayCallResult],
-) -> Vec<OutputItem> {
+) -> ExecutorResult<Vec<OutputItem>> {
     output_items
         .iter()
         .enumerate()
-        .map(|(item_index, item)| match item {
-            OutputItem::FunctionCall(call) if registry.is_client_custom_name(&call.name) => {
-                crate::tool::CustomHandler::output_item(call)
-            }
-            OutputItem::FunctionCall(call) if registry.is_gateway_owned_name(&call.name) => gateway_results
-                .iter()
-                .find(|result| result.item_index == item_index)
-                .and_then(|result| result.public_output.clone())
-                .unwrap_or_else(|| OutputItem::FunctionCall(call.clone())),
-            other => other.clone(),
+        .map(|(item_index, item)| {
+            Ok(match item {
+                OutputItem::FunctionCall(call) if registry.is_client_custom_name(&call.name) => {
+                    crate::tool::CustomHandler::output_item(call)
+                }
+                OutputItem::FunctionCall(call) if registry.is_client_shell_name(&call.name) => {
+                    crate::tool::ShellHandler::output_item(call).ok_or_else(|| {
+                        ExecutorError::ParseError("shell function call contains invalid action arguments".to_owned())
+                    })?
+                }
+                OutputItem::FunctionCall(call) if registry.is_gateway_owned_name(&call.name) => gateway_results
+                    .iter()
+                    .find(|result| result.item_index == item_index)
+                    .and_then(|result| result.public_output.clone())
+                    .unwrap_or_else(|| OutputItem::FunctionCall(call.clone())),
+                other => other.clone(),
+            })
         })
         .collect()
 }
@@ -423,6 +394,84 @@ fn output_item_value(item: &OutputItem) -> ExecutorResult<serde_json::Value> {
     serde_json::to_value(item).map_err(ExecutorError::JsonError)
 }
 
+fn code_interpreter_event_frame(event: &CodeInterpreterCallStreamEvent) -> ExecutorResult<EventFrame> {
+    let event_type = match event {
+        CodeInterpreterCallStreamEvent::InProgress { .. } => SSEEventType::CodeInterpreterCallInProgress,
+        CodeInterpreterCallStreamEvent::CodeDelta { .. } => SSEEventType::CodeInterpreterCallCodeDelta,
+        CodeInterpreterCallStreamEvent::CodeDone { .. } => SSEEventType::CodeInterpreterCallCodeDone,
+        CodeInterpreterCallStreamEvent::Interpreting { .. } => SSEEventType::CodeInterpreterCallInterpreting,
+        CodeInterpreterCallStreamEvent::Completed { .. } => SSEEventType::CodeInterpreterCallCompleted,
+    };
+    let value = serialize_to_value(event).map_err(ExecutorError::JsonError)?;
+    let wire = deserialize_from_value(value).map_err(ExecutorError::JsonError)?;
+    Ok(EventFrame {
+        event_type,
+        payload: EventPayload::None,
+        wire,
+    })
+}
+
+async fn emit_code_interpreter_event(
+    event: &CodeInterpreterCallStreamEvent,
+    stream_accumulator: &mut GatewayStreamAccumulator,
+    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> ExecutorResult<()> {
+    let mut frame = code_interpreter_event_frame(event)?;
+    emit_gateway_event(&mut frame, stream_accumulator, stream_sender).await
+}
+
+async fn emit_code_interpreter_start_events(
+    call: &crate::types::io::CodeInterpreterCall,
+    output_index: u32,
+    stream_accumulator: &mut GatewayStreamAccumulator,
+    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> ExecutorResult<()> {
+    let item_id = call.id.clone();
+    emit_code_interpreter_event(
+        &CodeInterpreterCallStreamEvent::InProgress {
+            item_id: item_id.clone(),
+            output_index,
+            sequence_number: stream_accumulator.upcoming_sequence_number(),
+        },
+        stream_accumulator,
+        stream_sender,
+    )
+    .await?;
+    emit_code_interpreter_event(
+        &CodeInterpreterCallStreamEvent::CodeDelta {
+            item_id: item_id.clone(),
+            output_index,
+            sequence_number: stream_accumulator.upcoming_sequence_number(),
+            delta: call.code.clone(),
+        },
+        stream_accumulator,
+        stream_sender,
+    )
+    .await?;
+    emit_code_interpreter_event(
+        &CodeInterpreterCallStreamEvent::CodeDone {
+            item_id: item_id.clone(),
+            output_index,
+            sequence_number: stream_accumulator.upcoming_sequence_number(),
+            code: call.code.clone(),
+        },
+        stream_accumulator,
+        stream_sender,
+    )
+    .await?;
+    emit_code_interpreter_event(
+        &CodeInterpreterCallStreamEvent::Interpreting {
+            item_id,
+            output_index,
+            sequence_number: stream_accumulator.upcoming_sequence_number(),
+        },
+        stream_accumulator,
+        stream_sender,
+    )
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn emit_response_start_events(
     payload: &ResponsePayload,
     stream_accumulator: &mut GatewayStreamAccumulator,
@@ -447,6 +496,31 @@ fn complete_gateway_event_plans<T: GatewayPublicOutputSource>(plans: &mut [Gatew
     }
 }
 
+async fn emit_gateway_added_event(
+    output_index: u32,
+    output_item: &OutputItem,
+    stream_accumulator: &mut GatewayStreamAccumulator,
+    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
+) -> ExecutorResult<()> {
+    let item = match output_item {
+        OutputItem::CodeInterpreterCall(call) => {
+            let mut added = call.clone();
+            added.code.clear();
+            output_item_value(&OutputItem::CodeInterpreterCall(added))?
+        }
+        _ => output_item_value(output_item)?,
+    };
+    let mut added_event = synthetic_event(
+        SSEEventType::OutputItemAdded,
+        [
+            ("output_index".to_owned(), serde_json::json!(output_index)),
+            ("item".to_owned(), item),
+        ],
+    )?;
+    emit_gateway_event(&mut added_event, stream_accumulator, stream_sender).await?;
+    Ok(())
+}
+
 pub(super) async fn emit_gateway_start_events<'a>(
     plans: impl IntoIterator<Item = &'a GatewayEventPlan>,
     stream_accumulator: &mut GatewayStreamAccumulator,
@@ -456,15 +530,7 @@ pub(super) async fn emit_gateway_start_events<'a>(
         let Some(output_item) = &plan.started_output else {
             continue;
         };
-        let item = output_item_value(output_item)?;
-        let mut added_event = synthetic_event(
-            SSEEventType::OutputItemAdded,
-            [
-                ("output_index".to_owned(), serde_json::json!(plan.output_index)),
-                ("item".to_owned(), item),
-            ],
-        )?;
-        emit_gateway_event(&mut added_event, stream_accumulator, stream_sender).await?;
+        emit_gateway_added_event(plan.output_index, output_item, stream_accumulator, stream_sender).await?;
         match output_item {
             OutputItem::WebSearchCall(web_search_call) => {
                 let mut in_progress_event = synthetic_event(
@@ -523,12 +589,25 @@ pub(super) async fn emit_gateway_start_events<'a>(
                 )?;
                 emit_gateway_event(&mut in_progress_event, stream_accumulator, stream_sender).await?;
             }
+            OutputItem::CodeInterpreterCall(code_interpreter_call) => {
+                emit_code_interpreter_start_events(
+                    code_interpreter_call,
+                    plan.output_index,
+                    stream_accumulator,
+                    stream_sender,
+                )
+                .await?;
+            }
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
+            | OutputItem::ShellCall(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
             | OutputItem::Unknown => {}
         }
     }
@@ -570,15 +649,30 @@ pub(super) async fn emit_gateway_completed_events<'a, T: GatewayPublicOutputSour
                 },
                 list_tools.id.as_str(),
             )),
-            OutputItem::Compaction(_) => None,
+            OutputItem::CodeInterpreterCall(_) | OutputItem::Compaction(_) | OutputItem::ShellCall(_) => None,
             OutputItem::Message(_)
             | OutputItem::FunctionCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
             | OutputItem::Reasoning(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
             | OutputItem::Unknown => continue,
         };
         let item = output_item_value(public_output)?;
+        if let OutputItem::CodeInterpreterCall(code_interpreter_call) = public_output {
+            emit_code_interpreter_event(
+                &CodeInterpreterCallStreamEvent::Completed {
+                    item_id: code_interpreter_call.id.clone(),
+                    output_index,
+                    sequence_number: stream_accumulator.upcoming_sequence_number(),
+                },
+                stream_accumulator,
+                stream_sender,
+            )
+            .await?;
+        }
         if let Some((event_type, item_id)) = completed_event {
             let mut completed_fields = serde_json::Map::from_iter([
                 ("item_id".to_owned(), serde_json::json!(item_id)),
@@ -627,63 +721,15 @@ pub(super) async fn execute_and_emit_output_calls(
     Ok(gateway_results)
 }
 
-async fn emit_gateway_event(
-    frame: &mut crate::events::EventFrame,
-    stream_accumulator: &mut GatewayStreamAccumulator,
-    stream_sender: &tokio::sync::mpsc::Sender<StreamEvent>,
-) -> ExecutorResult<()> {
-    if stream_accumulator.process_event(frame, 0) {
-        emit_sse_frame(stream_sender, frame).await?;
-    }
-    Ok(())
-}
-
-pub(super) fn append_input_item(input: &mut ResponsesInput, item: InputItem) {
-    match input {
-        ResponsesInput::Items(items) => items.push(item),
-        ResponsesInput::Text(text) => {
-            let text_input = ResponsesInput::Text(std::mem::take(text));
-            let mut items = Vec::<InputItem>::from(&text_input);
-            items.push(item);
-            *input = ResponsesInput::Items(items);
-        }
-    }
-}
-
-pub(super) fn append_output_items_to_input(input: &mut ResponsesInput, output_items: &[OutputItem]) {
-    for input_item in output_items.iter().filter_map(OutputItem::to_input_item) {
-        append_input_item(input, input_item);
-    }
-}
-
-pub(super) fn append_tool_outputs(ctx: &mut RequestContext, tool_outputs: Vec<InputItem>) {
-    for output in tool_outputs {
-        ctx.new_input_items.push(output.clone());
-        append_input_item(&mut ctx.enriched_request.input, output);
-    }
-}
-
-pub(super) fn append_gateway_calls_to_new_input(
-    ctx: &mut RequestContext,
-    output_items: &[OutputItem],
-    registry: &ToolRegistry,
-) {
-    ctx.new_input_items.extend(output_items.iter().filter_map(|item| {
-        let OutputItem::FunctionCall(call) = item else {
-            return None;
-        };
-        registry
-            .is_gateway_owned_name(&call.name)
-            .then(|| InputItem::FunctionCall(call.clone().into()))
-    }));
-}
-
 #[cfg(test)]
 mod tests {
     use super::GatewayCallResult;
     use crate::executor::accumulator::ResponseAccumulator;
     use crate::types::io::output::{FunctionToolCall, McpListTool, McpListTools};
-    use crate::types::io::{CompactionItem, InputItem, McpCallStatus};
+    use crate::types::io::{
+        CodeInterpreterCall, CodeInterpreterCallOutput, CodeInterpreterCallStatus, CompactionItem, InputItem,
+        McpCallStatus,
+    };
     use tokio::sync::{Notify, Semaphore, mpsc};
 
     fn parse_named_sse_event(content: &str) -> Value {
@@ -982,6 +1028,7 @@ mod tests {
 
     fn web_search_call(call_id: &str) -> FunctionToolCall {
         FunctionToolCall {
+            agent: None,
             id: format!("fc_{call_id}"),
             call_id: call_id.to_owned(),
             name: "web_search".to_owned(),
@@ -1068,9 +1115,7 @@ mod tests {
         let web_search: ResponsesTool =
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).expect("web_search tool param");
         let mut executors = GatewayExecutors::default();
-        executors.insert(Arc::new(SizedOutputExecutor {
-            bytes: crate::executor::response_budget::MAX_EXECUTOR_RESPONSE_BYTES / 2 + 1,
-        }));
+        executors.insert(Arc::new(SizedOutputExecutor { bytes: 250 * 1024 + 1 }));
         let mut tools = [web_search];
         let registry = ToolRegistry::build_with_handlers(&mut tools, &mut executors)
             .await
@@ -1080,7 +1125,7 @@ mod tests {
             OutputItem::FunctionCall(web_search_call("call_b")),
         ];
         let mut scheduler = GatewayScheduler::plan(&output_items, &registry, 0, GatewaySchedulerPolicy::default());
-        let response_budget = ExecutorResponseBudget::new();
+        let response_budget = ExecutorResponseBudget::with_limit(500 * 1024);
 
         let error = scheduler
             .execute_with_budget(&response_budget)
@@ -1470,6 +1515,7 @@ mod tests {
         let mut call = web_search_call(call_id);
         call.name = name.to_owned();
         GatewayCallPlan {
+            tool_type: crate::tool::ToolType::WebSearch,
             item_index,
             events: GatewayEventPlan {
                 output_index: u32::try_from(item_index).expect("test item index fits in u32"),
@@ -1584,7 +1630,8 @@ mod tests {
             )],
         );
         let discovered_output = crate::tool::mcp::handler::list_tools_output_item(&list_tools);
-        let public_output = super::public_output_items(&[discovered_output], &ToolRegistry::default(), &[]);
+        let public_output =
+            super::public_output_items(&[discovered_output], &ToolRegistry::default(), &[]).expect("public output");
         let plans = super::mcp_list_tools_event_plans(&public_output, 0);
         let (sender, mut receiver) = mpsc::channel(32);
         let mut stream_accumulator = crate::executor::gateway_accumulator::GatewayStreamAccumulator::new();
@@ -1631,6 +1678,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_uses_shared_gateway_event_lifecycle_without_intermediate_event() {
         let public_output = [OutputItem::Compaction(CompactionItem {
+            agent: None,
             id: Some("cmp_1".to_owned()),
             encrypted_content: "durable summary".to_owned(),
         })];
@@ -1673,8 +1721,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn code_interpreter_gateway_events_follow_openai_lifecycle() {
+        let mut plans = vec![super::GatewayEventPlan {
+            output_index: 4,
+            started_output: Some(OutputItem::CodeInterpreterCall(CodeInterpreterCall {
+                agent: None,
+                id: "ci_1".to_owned(),
+                container_id: "cntr_1".to_owned(),
+                code: "print(6 * 7)".to_owned(),
+                status: CodeInterpreterCallStatus::InProgress,
+                outputs: None,
+                origin: crate::types::io::code_interpreter::CodeInterpreterCallOrigin::Gateway,
+            })),
+            completed_output: None,
+            arguments: None,
+        }];
+        let final_item = OutputItem::CodeInterpreterCall(CodeInterpreterCall {
+            agent: None,
+            id: "ci_1".to_owned(),
+            container_id: "cntr_1".to_owned(),
+            code: "print(6 * 7)".to_owned(),
+            status: CodeInterpreterCallStatus::Completed,
+            outputs: Some(vec![CodeInterpreterCallOutput::logs("42\n".to_owned())]),
+            origin: crate::types::io::code_interpreter::CodeInterpreterCallOrigin::Gateway,
+        });
+        let (sender, mut receiver) = mpsc::channel(16);
+        let mut stream_accumulator = crate::executor::gateway_accumulator::GatewayStreamAccumulator::new();
+
+        super::emit_gateway_start_events(&plans, &mut stream_accumulator, &sender)
+            .await
+            .expect("start events");
+        super::complete_gateway_event_plans(&mut plans, std::slice::from_ref(&final_item));
+        super::emit_gateway_completed_events(
+            std::slice::from_ref(&final_item),
+            &plans,
+            &mut stream_accumulator,
+            &sender,
+        )
+        .await
+        .expect("completed events");
+
+        let events = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|event| parse_named_sse_event(&event.content))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().expect("event type"))
+                .collect::<Vec<_>>(),
+            vec![
+                "response.output_item.added",
+                "response.code_interpreter_call.in_progress",
+                "response.code_interpreter_call_code.delta",
+                "response.code_interpreter_call_code.done",
+                "response.code_interpreter_call.interpreting",
+                "response.code_interpreter_call.completed",
+                "response.output_item.done",
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence_number"].as_u64().expect("sequence number"))
+                .collect::<Vec<_>>(),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert!(events.iter().all(|event| event["output_index"] == 4));
+        assert_eq!(events[0]["item"]["id"], "ci_1");
+        assert_eq!(events[0]["item"]["code"], "");
+        assert!(events[0]["item"]["outputs"].is_null());
+        assert_eq!(events[1]["item_id"], "ci_1");
+        assert_eq!(events[2]["delta"], "print(6 * 7)");
+        assert_eq!(events[3]["code"], "print(6 * 7)");
+        assert_eq!(events[5]["item_id"], "ci_1");
+        assert_eq!(events[6]["item"]["id"], "ci_1");
+        assert_eq!(events[6]["item"]["code"], "print(6 * 7)");
+        assert_eq!(events[6]["item"]["outputs"][0]["logs"], "42\n");
+
+        // Emitting SSE frames must not turn the typed gateway projection into
+        // an upstream-native call when the response is stored for continuation.
+        let stored = String::try_from(&crate::storage::InOutItem::Output(final_item))
+            .expect("store streamed gateway projection");
+        let item = crate::storage::models::item::Item {
+            id: "ci_1".to_owned(),
+            reference_id: None,
+            data: stored,
+            created_at: 0,
+            conversation_id: None,
+            seq: None,
+            tenant_id: None,
+        };
+        let history = vec![item.as_inout().expect("rehydrate streamed projection")];
+        assert!(crate::storage::InOutItem::into_input_items(history).is_empty());
+        let public = serde_json::to_value(item.as_output().expect("public output")).expect("serialize public item");
+        assert!(public.get("_agentic_code_interpreter_origin").is_none());
+    }
+
+    #[tokio::test]
     async fn mcp_gateway_events_follow_openai_lifecycle() {
         let call = FunctionToolCall {
+            agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),
             name: "mcp__counter__increment".to_owned(),
@@ -1775,6 +1921,7 @@ mod tests {
     #[tokio::test]
     async fn failed_mcp_gateway_events_keep_contiguous_sequence_numbers() {
         let call = FunctionToolCall {
+            agent: None,
             id: "fc_1".to_owned(),
             call_id: "call_1".to_owned(),
             name: "mcp__counter__increment".to_owned(),

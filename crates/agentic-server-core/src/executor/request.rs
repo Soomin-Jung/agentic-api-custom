@@ -1,10 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::{Config, default_database_url};
+use crate::config::{Config, ResponsesConfig, default_database_url};
 use crate::error::Error;
 use crate::executor::gateway::GatewaySchedulerPolicy;
 use crate::executor::modes::{ConversationHandler, ResponseHandler};
+use crate::executor::multi_agent::ValidatedTreeCheckpoint;
 use crate::storage::backend::redact_database_urls;
 use crate::storage::{
     ConversationStore, ConversationVersion, DatabaseBackend, ResponseStore, create_pool_with_schema_and_configs,
@@ -22,12 +23,16 @@ const GATEWAY_TOOL_ALIASES_ENV: &str = "MESSAGES_GATEWAY_TOOL_ALIASES";
 /// Context built by `rehydrate_conversation`, threaded through the execute pipeline.
 #[derive(Debug)]
 pub struct RequestContext {
+    /// Private canonical tree; committed atomically with response metadata.
+    pub multi_agent_tree: Option<ValidatedTreeCheckpoint>,
     /// Untouched original request from the client.
     pub original_request: RequestPayload,
     /// Enriched request with rehydrated conversation history injected into `.input`.
     /// This is the request forwarded to the LLM.
     pub enriched_request: RequestPayload,
-    /// Only the new input items submitted by the client this turn (used for persistence).
+    /// This turn's canonical input items for persistence, including built-in calls
+    /// and call outputs. Session execution also records each round's other output
+    /// items here in inference order; compaction can replace them with a new window.
     pub new_input_items: Vec<InputItem>,
     /// Our generated response ID (uuid7 with "resp_" prefix).
     pub response_id: String,
@@ -36,6 +41,8 @@ pub struct RequestContext {
     /// Conversation version captured with rehydrated history.
     /// `None` for non-conversation and `previous_response_id` execution.
     pub conversation_version: Option<ConversationVersion>,
+    /// Optional transient-session lease and canonical parent snapshot. Never serialized.
+    pub continuation: Option<super::session::ResponseContinuation>,
 }
 
 impl RequestContext {
@@ -66,12 +73,14 @@ pub struct ExecutionContext {
     pub messages_gateway_tools: GatewayToolMap,
     /// Base URL for the LLM backend, e.g. `"http://localhost:8000"`.
     pub llm_base_url: String,
-    /// Maximum wait time for the next SSE chunk.  `Duration::ZERO` disables the timeout.
+    /// Maximum wait for the next body chunk in a streaming request, including HTTP error bodies.
+    /// Applies after response headers arrive; `Duration::ZERO` disables the timeout.
     /// Sourced from the `STREAMING_CHUNK_TIMEOUT_S` environment variable, defaulting to
     /// [`DEFAULT_STREAMING_TIMEOUT`] when unset or unparseable.
     pub streaming_timeout: Duration,
     /// Bounded-concurrency policy applied to gateway-owned calls in each round.
     pub(crate) gateway_scheduler_policy: GatewaySchedulerPolicy,
+    pub responses_config: ResponsesConfig,
     storage_pool: Option<Arc<crate::storage::DbPool>>,
 }
 
@@ -105,8 +114,15 @@ impl ExecutionContext {
             llm_base_url,
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::default(),
+            responses_config: ResponsesConfig::default(),
             storage_pool: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_responses_config(mut self, responses_config: ResponsesConfig) -> Self {
+        self.responses_config = responses_config;
+        self
     }
 
     #[must_use]
@@ -161,7 +177,7 @@ impl ExecutionContext {
         let resp_handler = ResponseHandler::new(ResponseStore::new(pool.clone()));
         let client = Arc::new(reqwest::Client::new());
         let gateway_executors = GatewayExecutors::from_config(Arc::clone(&client), &cfg.tools)
-            .map_err(|error| Error::Config(format!("failed to validate configured MCP server policies: {error}")))?;
+            .map_err(|error| Error::Config(format!("failed to validate configured gateway tool policies: {error}")))?;
         Ok(Self {
             conv_handler,
             resp_handler,
@@ -176,6 +192,7 @@ impl ExecutionContext {
             llm_base_url: cfg.llm_api_base.clone(),
             streaming_timeout: streaming_timeout_from_env(),
             gateway_scheduler_policy: GatewaySchedulerPolicy::new(cfg.tools.max_concurrent_gateway_calls),
+            responses_config: cfg.responses,
             storage_pool: Some(pool),
         })
     }

@@ -14,14 +14,28 @@ exclude = [
 [lib]
 name = "agentic_core"
 
+[features]
+default = []
+openapi = ["dep:utoipa"]
+# Opt-in embedded Eryx runtime. It is additionally operator-gated at startup;
+# default builds retain no Eryx dependency or code-interpreter registration.
+embedded-code-interpreter = ["dep:async-trait", "dep:eryx", "dep:nix"]
+
 [dependencies]
+utoipa = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+eryx = { workspace = true, optional = true }
+
 async-stream.workspace = true
 bytes.workspace = true
+base64 = "0.22"
+ring = "0.17"
 dirs.workspace = true
 either.workspace = true
 futures.workspace = true
 indexmap.workspace = true
 http.workspace = true
+opentelemetry.workspace = true
 percent-encoding.workspace = true
 reqwest = { workspace = true, features = ["default-tls", "stream"] }
 rmcp-reqwest.workspace = true
@@ -36,19 +50,30 @@ serde_json.workspace = true
 sse-stream.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 url.workspace = true
 
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "any", "migrate", "sqlite", "postgres"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["socket", "user"], optional = true }
+
 [dev-dependencies]
+flate2 = "1.1"
 axum.workspace = true
 criterion = { workspace = true }
+# Span capture for execution-trace tests only; the library itself never
+# depends on the OpenTelemetry SDK (embedders supply their own providers).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serde_yaml = "0.9"
 serde_yml = "0.0.12"
 tokio = { workspace = true, features = ["full"] }
+toml.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "benches"

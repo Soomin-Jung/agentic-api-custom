@@ -1,3 +1,7 @@
+mod validation;
+pub(crate) use validation::ensure_request_prepared;
+use validation::{request_contains_tool_search_state, validate_tool_search_request};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -7,8 +11,8 @@ use serde_json::{Map, Value};
 use crate::types::event::{MessageStatus, ResponseStatus};
 use crate::types::io::output::FunctionToolCall;
 use crate::types::io::{
-    FunctionTool, FunctionToolResultMessage, InputFunctionToolCall, InputItem, InputToolSearchCall, OutputItem,
-    ResponsesInput, ToolCallOutput, ToolChoice, ToolSearchCall, ToolSearchOutputMessage,
+    FunctionTool, FunctionToolResultMessage, InputFunctionToolCall, InputItem, InputToolSearchCall, ResponsesInput,
+    ToolCallOutput, ToolChoice, ToolSearchCall, ToolSearchOutputMessage,
 };
 use crate::types::request_response::RequestPayload;
 use crate::types::tools::{
@@ -19,7 +23,7 @@ use crate::utils::common::{deserialize_from_str, deserialize_from_value, seriali
 
 use super::CodexNamespaceHandler;
 use super::handler::{ToolError, ToolHandler};
-use super::registry::{ToolEntry, ToolRegistry, ToolType};
+use super::registry::{ToolEntry, ToolType};
 
 pub(crate) const TOOL_SEARCH_NAME: &str = "tool_search";
 const DEFAULT_DESCRIPTION: &str = "Search the client tool catalog";
@@ -61,51 +65,6 @@ impl ToolSearchHandler {
         }
         state.prepare_inference_request(request)?;
         Ok(Some(state))
-    }
-
-    /// Normalize native and synthetic upstream tool-search calls into the
-    /// canonical public output item.
-    pub(crate) fn normalize_response_output(
-        registry: &ToolRegistry,
-        output: &mut Vec<OutputItem>,
-        status: ResponseStatus,
-        unfinished_stream_item_ids: &HashSet<String>,
-    ) -> Result<(), ToolError> {
-        let discard_unidentified_unfinished = matches!(status, ResponseStatus::Error | ResponseStatus::Incomplete);
-        let mut normalized = Vec::with_capacity(output.len());
-        let mut saw_tool_search_call = false;
-        for item in std::mem::take(output) {
-            match item {
-                OutputItem::FunctionCall(call) => {
-                    ensure_function_is_available(registry.is_withheld_function(&call.name))?;
-                    if registry.tool_type(&call.name) == ToolType::ToolSearch {
-                        if saw_tool_search_call {
-                            return Err(invalid_upstream_search_call());
-                        }
-                        saw_tool_search_call = true;
-                        if let Some(public) =
-                            project_synthetic_call(&call, status, unfinished_stream_item_ids.contains(&call.id))?
-                        {
-                            normalized.push(OutputItem::ToolSearchCall(public));
-                        }
-                    } else if !(discard_unidentified_unfinished && unfinished_stream_item_ids.contains(&call.id)) {
-                        normalized.push(OutputItem::FunctionCall(call));
-                    }
-                }
-                OutputItem::ToolSearchCall(call) => {
-                    if saw_tool_search_call {
-                        return Err(invalid_upstream_search_call());
-                    }
-                    saw_tool_search_call = true;
-                    if let Some(public) = project_native_call(&call, status)? {
-                        normalized.push(OutputItem::ToolSearchCall(public));
-                    }
-                }
-                item => normalized.push(item),
-            }
-        }
-        *output = normalized;
-        Ok(())
     }
 
     #[must_use]
@@ -252,10 +211,6 @@ enum ToolSearchActivity {
     Active,
 }
 
-struct PendingSearchCall {
-    call_id: String,
-}
-
 struct DefinitionAccumulator<'a> {
     public_tools: &'a mut Vec<ResponsesTool>,
     definitions: &'a mut Vec<DefinitionRecord>,
@@ -308,6 +263,7 @@ impl CatalogEntry {
 ///
 /// The state deliberately has no `Serialize` implementation and its `Debug`
 /// output contains counts only.
+#[derive(Clone)]
 pub struct ToolSearchState {
     activity: ToolSearchActivity,
     has_completed_search: bool,
@@ -565,101 +521,6 @@ impl ToolSearchState {
     }
 }
 
-fn validate_tool_search_request(request: &RequestPayload, input: &ResponsesInput) -> Result<bool, ToolError> {
-    if !request_contains_tool_search_state(request, input) {
-        return Ok(false);
-    }
-
-    let tools = request.tools.as_deref().unwrap_or_default();
-    if tools
-        .iter()
-        .filter(|tool| matches!(tool, ResponsesTool::ToolSearch(_)))
-        .count()
-        > 1
-    {
-        return Err(ToolError::Config(
-            "tool search accepts at most one tool_search declaration".to_owned(),
-        ));
-    }
-    if request.parallel_tool_calls == Some(true) {
-        return Err(ToolError::Config(
-            "parallel_tool_calls must be false when tool search is active".to_owned(),
-        ));
-    }
-
-    for tool in tools {
-        tool.validate()?;
-        if has_reserved_tool_search_name(tool) {
-            return Err(ToolError::Config(
-                "model-visible tool name 'tool_search' is reserved while tool search is active".to_owned(),
-            ));
-        }
-    }
-
-    Ok(true)
-}
-
-fn request_contains_tool_search_state<T: ?Sized>(request: &RequestPayload<T>, input: &ResponsesInput) -> bool {
-    input_contains_tool_search_state(input)
-        || request
-            .tools
-            .as_deref()
-            .is_some_and(|tools| tools.iter().any(tool_activates_tool_search))
-}
-
-fn input_contains_tool_search_state(input: &ResponsesInput) -> bool {
-    matches!(
-        input,
-        ResponsesInput::Items(items)
-            if items
-                .iter()
-                .any(|item| matches!(item, InputItem::ToolSearchCall(_) | InputItem::ToolSearchOutput(_)))
-    )
-}
-
-fn tool_activates_tool_search(tool: &ResponsesTool) -> bool {
-    matches!(tool, ResponsesTool::ToolSearch(_)) || tool_has_deferred_definition(tool)
-}
-
-fn tool_has_deferred_definition(tool: &ResponsesTool) -> bool {
-    match tool {
-        ResponsesTool::Function(function) => function.defer_loading == Some(true),
-        ResponsesTool::Namespace(namespace) => namespace.tools.iter().any(
-            |member| matches!(member, CodexNamespaceMember::Function(function) if function.defer_loading == Some(true)),
-        ),
-        ResponsesTool::Mcp(mcp) => mcp.defer_loading == Some(true),
-        ResponsesTool::Custom(custom) => custom.defer_loading == Some(true),
-        ResponsesTool::ToolSearch(_)
-        | ResponsesTool::WebSearch(_)
-        | ResponsesTool::FileSearch(_)
-        | ResponsesTool::CodeInterpreter(_)
-        | ResponsesTool::Unknown => false,
-    }
-}
-
-pub(crate) fn ensure_request_prepared(request: &RequestPayload, prepared: bool) -> Result<(), ToolError> {
-    if ToolSearchHandler::request_has_state(request) && !prepared {
-        return Err(ToolError::Config(
-            "tool_search requests require prepared request-scoped state before upstream conversion".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn has_reserved_tool_search_name(tool: &ResponsesTool) -> bool {
-    match tool {
-        ResponsesTool::Function(function) => function.name.as_str() == TOOL_SEARCH_NAME,
-        ResponsesTool::Custom(custom) => custom.name.as_str() == TOOL_SEARCH_NAME,
-        ResponsesTool::Namespace(namespace) => namespace.name == TOOL_SEARCH_NAME,
-        ResponsesTool::ToolSearch(_)
-        | ResponsesTool::Mcp(_)
-        | ResponsesTool::WebSearch(_)
-        | ResponsesTool::FileSearch(_)
-        | ResponsesTool::CodeInterpreter(_)
-        | ResponsesTool::Unknown => false,
-    }
-}
-
 fn validate_effective_tool_choice(
     tool_choice: Option<&ToolChoice>,
     withheld_function_names: &HashSet<String>,
@@ -765,6 +626,7 @@ pub(crate) fn started_public_call(call: &FunctionToolCall) -> Result<ToolSearchC
         return Err(invalid_upstream_search_call());
     }
     Ok(ToolSearchCall {
+        agent: call.agent.clone(),
         id: public_item_id(&call.id),
         call_id: call.call_id.clone(),
         execution: crate::types::tools::ToolSearchExecution::Client,
@@ -841,6 +703,8 @@ pub(crate) fn strict_started_function(item: &Value) -> Result<FunctionToolCall, 
 
 #[derive(Debug, Deserialize)]
 struct StrictFunctionToolCall {
+    #[serde(default)]
+    agent: Option<crate::types::io::AgentAttribution>,
     id: String,
     call_id: String,
     name: String,
@@ -857,6 +721,7 @@ pub(crate) fn strict_function_call(item: &Value) -> Result<FunctionToolCall, Too
         return Err(invalid_upstream_search_call());
     }
     let call = FunctionToolCall {
+        agent: call.agent,
         id: call.id,
         call_id: call.call_id,
         name: call.name,
@@ -899,7 +764,7 @@ pub(crate) fn validate_blocking_response(
         .and_then(Value::as_str)
         .map_or(ResponseStatus::Completed, |status| status.parse().unwrap_or_default());
     let allow_unfinished = matches!(status, ResponseStatus::Error | ResponseStatus::Incomplete);
-    let mut saw_tool_search_call = false;
+    let mut call_ids = HashSet::new();
     for item in value.get("output").and_then(Value::as_array).into_iter().flatten() {
         if item.get("type").and_then(Value::as_str) == Some("function_call")
             && item
@@ -911,11 +776,10 @@ pub(crate) fn validate_blocking_response(
         }
         match item.get("type").and_then(Value::as_str) {
             Some("tool_search_call") => {
-                if saw_tool_search_call {
+                let call = strict_native_call(item.clone())?;
+                if !call_ids.insert(call.call_id.clone()) {
                     return Err(invalid_upstream_search_call());
                 }
-                saw_tool_search_call = true;
-                let call = strict_native_call(item.clone())?;
                 if !allow_unfinished && call.status != ToolSearchStatus::Completed {
                     return Err(invalid_upstream_search_call());
                 }
@@ -923,11 +787,10 @@ pub(crate) fn validate_blocking_response(
             Some("function_call")
                 if tool_search_enabled && item.get("name").and_then(Value::as_str) == Some(TOOL_SEARCH_NAME) =>
             {
-                if saw_tool_search_call {
+                let call = strict_function_call(item)?;
+                if !call_ids.insert(call.call_id.clone()) {
                     return Err(invalid_upstream_search_call());
                 }
-                saw_tool_search_call = true;
-                let call = strict_function_call(item)?;
                 if !allow_unfinished && call.status != MessageStatus::Completed {
                     return Err(invalid_upstream_search_call());
                 }
@@ -978,6 +841,7 @@ fn definition_record(
         | ResponsesTool::WebSearch(_)
         | ResponsesTool::FileSearch(_)
         | ResponsesTool::CodeInterpreter(_)
+        | ResponsesTool::Shell(_)
         | ResponsesTool::Custom(_)
         | ResponsesTool::Unknown => {
             return Err(ToolError::Config(
@@ -1121,7 +985,7 @@ fn prepare_history(
         return Ok(input.clone());
     };
     let mut private_items = Vec::with_capacity(items.len());
-    let mut unresolved_call: Option<PendingSearchCall> = None;
+    let mut unresolved_calls = HashSet::new();
     let mut completed_call_ids = HashSet::new();
     let mut item_ids = HashSet::new();
     let DefinitionViews {
@@ -1148,7 +1012,7 @@ fn prepare_history(
             InputItem::ToolSearchCall(call) => {
                 private_items.push(prepare_search_call(
                     call,
-                    &mut unresolved_call,
+                    &mut unresolved_calls,
                     &completed_call_ids,
                     &mut item_ids,
                 )?);
@@ -1156,7 +1020,7 @@ fn prepare_history(
             InputItem::ToolSearchOutput(output) => {
                 private_items.push(prepare_search_output(
                     output,
-                    &mut unresolved_call,
+                    &mut unresolved_calls,
                     &mut completed_call_ids,
                     &mut definition_accumulator,
                 )?);
@@ -1167,17 +1031,23 @@ fn prepare_history(
             }
             InputItem::CompactionTrigger => {}
             InputItem::Message(_)
+            | InputItem::CodeInterpreterCall(_)
             | InputItem::McpListTools(_)
             | InputItem::FunctionCallOutput(_)
             | InputItem::CustomToolCall(_)
             | InputItem::CustomToolCallOutput(_)
+            | InputItem::ShellCall(_)
+            | InputItem::ShellCallOutput(_)
             | InputItem::Reasoning(_)
             | InputItem::Compaction(_)
+            | InputItem::MultiAgentCall(_)
+            | InputItem::MultiAgentCallOutput(_)
+            | InputItem::AgentMessage(_)
             | InputItem::Unknown => private_items.push(item.clone()),
         }
     }
 
-    if unresolved_call.is_some() {
+    if !unresolved_calls.is_empty() {
         return Err(ToolError::Config(
             "unresolved tool_search_call requires a matching completed tool_search_output".to_owned(),
         ));
@@ -1230,7 +1100,7 @@ fn withheld_function_history_call() -> ToolError {
 
 fn prepare_search_call(
     call: &InputToolSearchCall,
-    unresolved_call: &mut Option<PendingSearchCall>,
+    unresolved_calls: &mut HashSet<String>,
     completed_call_ids: &HashSet<String>,
     item_ids: &mut HashSet<String>,
 ) -> Result<InputItem, ToolError> {
@@ -1245,20 +1115,13 @@ fn prepare_search_call(
     if !item_ids.insert(call.id.clone()) {
         return Err(ToolError::Config("duplicate tool_search_call item id".to_owned()));
     }
-    if unresolved_call.is_some() {
-        return Err(ToolError::Config(
-            "ambiguous tool-search history contains a call before the preceding call is resolved".to_owned(),
-        ));
-    }
-    if completed_call_ids.contains(call.call_id.as_str()) {
+    if completed_call_ids.contains(call.call_id.as_str()) || !unresolved_calls.insert(call.call_id.clone()) {
         return Err(ToolError::Config("duplicate tool_search_call call_id".to_owned()));
     }
     let canonical_arguments = serialize_to_string(&call.arguments)
         .map_err(|_| ToolError::Config("tool_search_call arguments could not be canonicalized safely".to_owned()))?;
-    *unresolved_call = Some(PendingSearchCall {
-        call_id: call.call_id.clone(),
-    });
     Ok(InputItem::FunctionCall(InputFunctionToolCall {
+        agent: call.agent.clone(),
         id: Some(call.id.clone()),
         call_id: call.call_id.clone(),
         name: TOOL_SEARCH_NAME.to_owned(),
@@ -1270,7 +1133,7 @@ fn prepare_search_call(
 
 fn prepare_search_output(
     output: &ToolSearchOutputMessage,
-    unresolved_call: &mut Option<PendingSearchCall>,
+    unresolved_calls: &mut HashSet<String>,
     completed_call_ids: &mut HashSet<String>,
     definition_accumulator: &mut DefinitionAccumulator<'_>,
 ) -> Result<InputItem, ToolError> {
@@ -1282,14 +1145,9 @@ fn prepare_search_output(
     if completed_call_ids.contains(output.call_id.as_str()) {
         return Err(ToolError::Config("duplicate tool_search_output call_id".to_owned()));
     }
-    let Some(pending) = unresolved_call.take() else {
+    if !unresolved_calls.remove(&output.call_id) {
         return Err(ToolError::Config(
-            "orphan tool_search_output has no unresolved call".to_owned(),
-        ));
-    };
-    if pending.call_id != output.call_id {
-        return Err(ToolError::Config(
-            "tool_search_output call_id does not match the preceding unresolved call".to_owned(),
+            "tool_search_output has no matching unresolved call_id".to_owned(),
         ));
     }
     if output.status != ToolSearchStatus::Completed {
@@ -1332,6 +1190,7 @@ fn model_visible_output_tools(tools: &[ResponsesTool]) -> Result<Vec<ModelVisibl
             | ResponsesTool::WebSearch(_)
             | ResponsesTool::FileSearch(_)
             | ResponsesTool::CodeInterpreter(_)
+            | ResponsesTool::Shell(_)
             | ResponsesTool::Custom(_)
             | ResponsesTool::Unknown => Err(ToolError::Config(
                 "tool_search_output contains an unsupported model-output definition".to_owned(),
@@ -1517,6 +1376,7 @@ fn loaded_tool_identity(tool: &ResponsesTool) -> Result<Option<LoadedToolIdentit
         | ResponsesTool::WebSearch(_)
         | ResponsesTool::FileSearch(_)
         | ResponsesTool::CodeInterpreter(_)
+        | ResponsesTool::Shell(_)
         | ResponsesTool::Custom(_)
         | ResponsesTool::Unknown => return Ok(None),
     };
@@ -1591,6 +1451,7 @@ fn build_catalog(
                 | ResponsesTool::WebSearch(_)
                 | ResponsesTool::FileSearch(_)
                 | ResponsesTool::CodeInterpreter(_)
+                | ResponsesTool::Shell(_)
                 | ResponsesTool::Custom(_)
                 | ResponsesTool::Unknown => None,
             }
@@ -1653,6 +1514,7 @@ fn build_private_tools(
             | ResponsesTool::WebSearch(_)
             | ResponsesTool::FileSearch(_)
             | ResponsesTool::CodeInterpreter(_)
+            | ResponsesTool::Shell(_)
             | ResponsesTool::Custom(_)
             | ResponsesTool::Unknown => Some(tool.clone()),
         })
@@ -1679,6 +1541,7 @@ fn available_public_tools(public_tools: &[ResponsesTool], loaded_tools: &[Respon
             | ResponsesTool::WebSearch(_)
             | ResponsesTool::FileSearch(_)
             | ResponsesTool::CodeInterpreter(_)
+            | ResponsesTool::Shell(_)
             | ResponsesTool::Custom(_)
             | ResponsesTool::Unknown => {}
         }
@@ -1724,6 +1587,7 @@ fn available_public_tools(public_tools: &[ResponsesTool], loaded_tools: &[Respon
             | ResponsesTool::WebSearch(_)
             | ResponsesTool::FileSearch(_)
             | ResponsesTool::CodeInterpreter(_)
+            | ResponsesTool::Shell(_)
             | ResponsesTool::Custom(_)
             | ResponsesTool::Unknown => Some(tool.clone()),
             ResponsesTool::ToolSearch(_) => None,
@@ -1757,6 +1621,7 @@ fn private_definition(
         | ResponsesTool::WebSearch(_)
         | ResponsesTool::FileSearch(_)
         | ResponsesTool::CodeInterpreter(_)
+        | ResponsesTool::Shell(_)
         | ResponsesTool::Custom(_)
         | ResponsesTool::Unknown => None,
     }
@@ -1796,516 +1661,4 @@ fn namespace_has_withheld_member(member_records: Option<&NamespaceMemberRecords>
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-    use crate::tool::ToolRegistry;
-
-    fn param(value: Value) -> ToolSearchToolParam {
-        let ResponsesTool::ToolSearch(param) = serde_json::from_value(value).expect("valid tool_search declaration")
-        else {
-            panic!("expected tool_search");
-        };
-        param
-    }
-
-    fn assert_invalid_blocking_search(registry: &ToolRegistry, case: &str, item: &Value) {
-        let body = json!({"status": "completed", "output": [item]}).to_string();
-        assert!(
-            matches!(
-                registry.validate_blocking_response(&body),
-                Err(ToolError::InvalidUpstreamToolSearch)
-            ),
-            "{case}"
-        );
-    }
-
-    #[test]
-    fn handler_validates_and_normalizes_exactly_one_function() {
-        let param = param(json!({
-            "type": "tool_search",
-            "execution": "client",
-            "description": "Find matching tools",
-            "parameters": {"type": "array", "items": {"type": "string"}}
-        }));
-        ToolSearchHandler.validate(&param).unwrap();
-        assert_eq!(ToolSearchHandler.tool_type(), ToolType::ToolSearch);
-        assert_eq!(
-            serde_json::to_value(ToolSearchHandler.normalize(&param)).unwrap(),
-            json!([{
-                "type": "function",
-                "name": "tool_search",
-                "description": "Find matching tools",
-                "parameters": {"type": "array", "items": {"type": "string"}},
-                "strict": false
-            }])
-        );
-    }
-
-    #[test]
-    fn handler_rejects_non_object_parameter_values() {
-        let param = param(json!({
-            "type": "tool_search",
-            "execution": "client",
-            "parameters": ["not", "an", "object"]
-        }));
-
-        let error = ToolSearchHandler
-            .validate(&param)
-            .expect_err("private function parameters require an object");
-        assert!(error.to_string().contains("parameters must be a JSON object"));
-    }
-
-    #[test]
-    fn normalization_uses_safe_defaults() {
-        let param = param(json!({"type": "tool_search", "execution": "client", "description": "  "}));
-        assert_eq!(
-            serde_json::to_value(ToolSearchHandler.normalize(&param)).unwrap(),
-            json!([{
-                "type": "function",
-                "name": "tool_search",
-                "description": "Search the client tool catalog",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {
-                        "type": "string",
-                        "description": "A concise description of the needed capabilities."
-                    }},
-                    "required": ["query"],
-                    "additionalProperties": false
-                },
-                "strict": false
-            }])
-        );
-    }
-
-    #[test]
-    fn synthetic_public_call_construction_is_validated_in_tool_layer() {
-        let valid = FunctionToolCall {
-            id: "fc_search".to_owned(),
-            call_id: "call_search".to_owned(),
-            name: TOOL_SEARCH_NAME.to_owned(),
-            namespace: None,
-            arguments: r#"["weather","timezone"]"#.to_owned(),
-            status: MessageStatus::Completed,
-        };
-        let started = started_public_call(&valid).expect("valid started call");
-        assert_eq!(started.id, "tsc_search");
-        assert_eq!(started.status, ToolSearchStatus::InProgress);
-        let completed = completed_public_call(&valid).expect("valid completed call");
-        assert_eq!(completed.arguments, json!(["weather", "timezone"]));
-
-        for invalid in [
-            FunctionToolCall {
-                name: "ordinary".to_owned(),
-                ..valid.clone()
-            },
-            FunctionToolCall {
-                namespace: Some("catalog".to_owned()),
-                ..valid.clone()
-            },
-            FunctionToolCall {
-                arguments: "not valid JSON".to_owned(),
-                ..valid.clone()
-            },
-            FunctionToolCall {
-                status: MessageStatus::InProgress,
-                ..valid.clone()
-            },
-        ] {
-            assert!(completed_public_call(&invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn terminal_projection_preserves_incomplete_and_discards_failed_calls() {
-        let synthetic = FunctionToolCall {
-            id: "fc_search".to_owned(),
-            call_id: "call_search".to_owned(),
-            name: TOOL_SEARCH_NAME.to_owned(),
-            namespace: None,
-            arguments: r#"{"query":"partial"#.to_owned(),
-            status: MessageStatus::InProgress,
-        };
-        let projected = project_synthetic_call(&synthetic, ResponseStatus::Incomplete, true)
-            .expect("incomplete synthetic projection")
-            .expect("incomplete synthetic call remains public");
-        assert_eq!(projected.id, "tsc_search");
-        assert_eq!(projected.arguments, json!({}));
-        assert_eq!(projected.status, ToolSearchStatus::Incomplete);
-        assert!(
-            project_synthetic_call(&synthetic, ResponseStatus::Error, true)
-                .unwrap()
-                .is_none()
-        );
-        assert!(project_synthetic_call(&synthetic, ResponseStatus::Completed, true).is_err());
-
-        let native = ToolSearchCall {
-            id: "tsc_search".to_owned(),
-            call_id: "call_search".to_owned(),
-            execution: crate::types::tools::ToolSearchExecution::Client,
-            arguments: json!({"query": "weather"}),
-            status: ToolSearchStatus::InProgress,
-        };
-        let projected = project_native_call(&native, ResponseStatus::Incomplete)
-            .expect("incomplete native projection")
-            .expect("incomplete native call remains public");
-        assert_eq!(projected.arguments, native.arguments);
-        assert_eq!(projected.status, ToolSearchStatus::Incomplete);
-        assert!(project_native_call(&native, ResponseStatus::Error).unwrap().is_none());
-        assert!(project_native_call(&native, ResponseStatus::Completed).is_err());
-    }
-
-    #[test]
-    fn registry_requires_tool_search_preparation_before_upstream_conversion() {
-        let mut request: RequestPayload = serde_json::from_value(json!({
-            "model": "test",
-            "input": "find weather",
-            "parallel_tool_calls": false,
-            "tools": [{"type": "tool_search", "execution": "client"}]
-        }))
-        .expect("request shape");
-
-        assert!(ToolRegistry::default().ensure_request_prepared(&request).is_err());
-        let state = ToolSearchHandler::prepare_request(&mut request, &[], false)
-            .expect("tool-search preparation")
-            .expect("active tool-search state");
-        let mut registry =
-            ToolRegistry::from_tool_types(HashMap::from([(TOOL_SEARCH_NAME.to_owned(), ToolType::ToolSearch)]));
-        registry
-            .install_tool_search_state(Some(state))
-            .expect("install prepared tool-search state");
-        registry
-            .ensure_request_prepared(&request)
-            .expect("prepared request is ready for upstream conversion");
-    }
-
-    #[test]
-    fn preparation_retains_mcp_list_metadata_until_upstream_projection() {
-        let mut request: RequestPayload = serde_json::from_value(json!({
-            "model": "test",
-            "input": [
-                {
-                    "type": "mcp_list_tools",
-                    "id": "mcpl_counter",
-                    "server_label": "counter",
-                    "tools": []
-                },
-                {"role": "user", "content": "find weather"}
-            ],
-            "parallel_tool_calls": false,
-            "tools": [{"type": "tool_search", "execution": "client"}]
-        }))
-        .expect("request shape");
-
-        ToolSearchHandler::prepare_request(&mut request, &[], false)
-            .expect("tool-search preparation")
-            .expect("active tool-search state");
-
-        let ResponsesInput::Items(prepared_items) = &request.input else {
-            panic!("expected prepared item input");
-        };
-        assert!(
-            prepared_items
-                .iter()
-                .any(|item| matches!(item, InputItem::McpListTools(list) if list.server_label == "counter"))
-        );
-
-        let model_input = request.input.model_input();
-        let ResponsesInput::Items(model_items) = model_input.as_ref() else {
-            panic!("expected model item input");
-        };
-        assert!(
-            model_items
-                .iter()
-                .all(|item| !matches!(item, InputItem::McpListTools(_)))
-        );
-    }
-
-    #[test]
-    fn ordinary_function_named_tool_search_does_not_require_preparation() {
-        let request: RequestPayload = serde_json::from_value(json!({
-            "model": "test",
-            "input": "call the ordinary function",
-            "tools": [{"type": "function", "name": "tool_search"}]
-        }))
-        .expect("ordinary function request");
-
-        ToolRegistry::default()
-            .ensure_request_prepared(&request)
-            .expect("the reserved name applies only to active tool search");
-    }
-
-    #[test]
-    fn registry_strictly_validates_blocking_search_without_changing_inactive_functions() {
-        let mut request: RequestPayload = serde_json::from_value(json!({
-            "model": "test",
-            "input": "find weather",
-            "parallel_tool_calls": false,
-            "tools": [{"type": "tool_search", "execution": "client"}]
-        }))
-        .expect("request shape");
-        let state = ToolSearchHandler::prepare_request(&mut request, &[], false)
-            .expect("tool-search preparation")
-            .expect("active tool-search state");
-        let mut registry =
-            ToolRegistry::from_tool_types(HashMap::from([(TOOL_SEARCH_NAME.to_owned(), ToolType::ToolSearch)]));
-        registry
-            .install_tool_search_state(Some(state))
-            .expect("install prepared tool-search state");
-        let native = json!({
-            "type": "tool_search_call",
-            "id": "tsc_1",
-            "call_id": "call_search",
-            "execution": "client",
-            "arguments": ["weather", "timezone"],
-            "status": "completed"
-        });
-        let synthetic = json!({
-            "type": "function_call",
-            "id": "fc_search",
-            "call_id": "call_search",
-            "name": "tool_search",
-            "arguments": "[\"weather\",\"timezone\"]",
-            "status": "completed"
-        });
-
-        for item in [&native, &synthetic] {
-            let body = json!({"status": "completed", "output": [item]}).to_string();
-            registry
-                .validate_blocking_response(&body)
-                .expect("native and synthetic array arguments are valid");
-        }
-        let malformed = [
-            ("native missing id", {
-                let mut item = native.clone();
-                item.as_object_mut().unwrap().remove("id");
-                item
-            }),
-            ("native missing call_id", {
-                let mut item = native.clone();
-                item.as_object_mut().unwrap().remove("call_id");
-                item
-            }),
-            ("native missing arguments", {
-                let mut item = native.clone();
-                item.as_object_mut().unwrap().remove("arguments");
-                item
-            }),
-            ("native namespace", {
-                let mut item = native.clone();
-                item["namespace"] = json!("catalog");
-                item
-            }),
-            ("synthetic missing status", {
-                let mut item = synthetic.clone();
-                item.as_object_mut().unwrap().remove("status");
-                item
-            }),
-            ("synthetic null status", {
-                let mut item = synthetic.clone();
-                item["status"] = Value::Null;
-                item
-            }),
-            ("synthetic invalid JSON arguments", {
-                let mut item = synthetic.clone();
-                item["arguments"] = json!("not valid JSON");
-                item
-            }),
-        ];
-
-        for (case, item) in malformed {
-            assert_invalid_blocking_search(&registry, case, &item);
-        }
-
-        let partial = json!({
-            "status": "incomplete",
-            "output": [{
-                "type": "function_call",
-                "id": "fc_partial",
-                "call_id": "call_partial",
-                "name": "tool_search",
-                "arguments": "{\"query\":",
-                "status": "in_progress"
-            }]
-        })
-        .to_string();
-        registry
-            .validate_blocking_response(&partial)
-            .expect("unfinished search placeholder is allowed on an incomplete response");
-
-        let ordinary = json!({
-            "status": "completed",
-            "output": [{"type": "function_call", "name": "tool_search", "arguments": "{}"}]
-        })
-        .to_string();
-        ToolRegistry::default()
-            .validate_blocking_response(&ordinary)
-            .expect("inactive ordinary function keeps generic compatibility defaults");
-    }
-
-    #[test]
-    fn prepared_response_tools_remove_request_scoped_mcp_secrets_and_discovery() {
-        let mut request: RequestPayload = serde_json::from_value(json!({
-            "model": "test",
-            "input": "find weather",
-            "parallel_tool_calls": false,
-            "tools": [
-                {"type": "tool_search", "execution": "client"},
-                {
-                    "type": "mcp",
-                    "server_label": "weather",
-                    "server_url": "https://mcp.example.test/mcp",
-                    "headers": {"Authorization": "Bearer header-secret"},
-                    "authorization": "field-secret",
-                    "_agentic_discovered_tools": [{
-                        "server_label": "weather",
-                        "tool_name": "forecast",
-                        "internal_name": "mcp__weather__forecast",
-                        "tool": {"name": "forecast", "inputSchema": {"type": "object"}}
-                    }]
-                }
-            ]
-        }))
-        .expect("request shape");
-
-        let state = ToolSearchHandler::prepare_request(&mut request, &[], false)
-            .expect("tool-search preparation")
-            .expect("active tool-search state");
-        let mut registry =
-            ToolRegistry::from_tool_types(HashMap::from([(TOOL_SEARCH_NAME.to_owned(), ToolType::ToolSearch)]));
-        registry
-            .install_tool_search_state(Some(state))
-            .expect("install prepared tool-search state");
-        let serialized = serde_json::to_value(registry.tool_search_response_tools().expect("active public tools"))
-            .expect("public tools serialize");
-        let serialized = serialized.to_string();
-
-        for secret in [
-            "header-secret",
-            "field-secret",
-            "mcp__weather__forecast",
-            "_agentic_discovered_tools",
-        ] {
-            assert!(!serialized.contains(secret));
-        }
-    }
-
-    #[test]
-    fn public_tool_search_item_ids_are_stable_and_domain_separated() {
-        assert_eq!(public_item_id("tsc_existing"), "tsc_existing");
-        assert_eq!(public_item_id("fc_search_1"), "tsc_search_1");
-        let first = public_item_id("provider-item-1");
-        assert_eq!(first, public_item_id("provider-item-1"));
-        assert!(first.starts_with("tsc_"));
-        assert_ne!(first, crate::tool::custom::public_item_id("provider-item-1"));
-    }
-
-    #[test]
-    fn response_tools_after_search_keep_immediate_and_loaded_public_availability() {
-        let request: RequestPayload = serde_json::from_value(serde_json::json!({
-            "model": "test",
-            "store": false,
-            "tools": [
-                {
-                    "type": "tool_search",
-                    "execution": "client",
-                    "description": "Find tools",
-                    "parameters": {"type": "object"}
-                },
-                {"type": "function", "name": "always_ready"},
-                {"type": "function", "name": "get_weather", "defer_loading": true},
-                {"type": "function", "name": "not_loaded", "defer_loading": true},
-                {
-                    "type": "namespace",
-                    "name": "travel",
-                    "tools": [
-                        {"type": "function", "name": "always_ready_member"},
-                        {"type": "function", "name": "get_timezone", "defer_loading": true},
-                        {"type": "function", "name": "not_loaded_member", "defer_loading": true}
-                    ]
-                }
-            ],
-            "input": [
-                {
-                    "type": "tool_search_call",
-                    "id": "tsc_1",
-                    "call_id": "call_search_1",
-                    "arguments": {"query": "weather and timezone"}
-                },
-                {
-                    "type": "tool_search_output",
-                    "call_id": "call_search_1",
-                    "tools": [
-                        {"type": "function", "name": "get_weather", "defer_loading": true},
-                        {
-                            "type": "namespace",
-                            "name": "travel",
-                            "tools": [{"type": "function", "name": "get_timezone", "defer_loading": true}]
-                        }
-                    ]
-                }
-            ]
-        }))
-        .expect("valid mixed-availability tool-search request");
-
-        let state = ToolSearchState::build(&request).expect("tool-search state");
-        let tools = serialize_to_value(&state.public_response_tools()).expect("response tools serialize");
-        assert_eq!(
-            tools,
-            serde_json::json!([
-                {"type": "function", "name": "always_ready"},
-                {"type": "function", "name": "get_weather"},
-                {
-                    "type": "namespace",
-                    "name": "travel",
-                    "tools": [
-                        {"type": "function", "name": "always_ready_member"},
-                        {"type": "function", "name": "get_timezone"}
-                    ]
-                }
-            ])
-        );
-    }
-
-    #[test]
-    fn tool_search_output_rejects_mcp_definitions() {
-        let request: RequestPayload = serde_json::from_value(serde_json::json!({
-            "model": "test",
-            "store": false,
-            "parallel_tool_calls": false,
-            "tools": [{
-                "type": "tool_search",
-                "execution": "client",
-                "description": "Find a tool",
-                "parameters": {"type": "object"}
-            }],
-            "input": [
-                {
-                    "type": "tool_search_call",
-                    "id": "tsc_1",
-                    "call_id": "call_search_1",
-                    "arguments": {"query": "weather"}
-                },
-                {
-                    "type": "tool_search_output",
-                    "call_id": "call_search_1",
-                    "tools": [{
-                        "type": "mcp",
-                        "server_label": "weather",
-                        "server_url": "https://mcp.example.test/mcp"
-                    }]
-                }
-            ]
-        }))
-        .expect("typed request");
-
-        let error = ToolSearchState::build(&request).expect_err("MCP is not a client-loaded tool definition");
-
-        assert!(matches!(
-            error,
-            ToolError::Config(message) if message.contains("unsupported tool definition")
-        ));
-    }
-}
+mod tests;

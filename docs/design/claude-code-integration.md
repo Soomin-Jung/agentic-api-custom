@@ -190,7 +190,41 @@ Recommendation: ship A.
 | gateway-owned `tool_use` (web_search, MCP) | gateway executes, appends a `tool_result`, loops |
 | client-owned `tool_use` | returned to the client, which executes and resends `tool_result` |
 | `tool_result` content block (may carry `is_error: true`) | fed into the next upstream turn |
-| `tool_choice` (`auto`/`any`/`tool`/`none`, `disable_parallel_tool_use`) | preserved and forwarded; the loop must not assume one tool per turn |
+| `tool_choice` (`auto`/`any`/`tool`/`none`, `disable_parallel_tool_use`) | forwarded on the first round; a fulfilled forced choice becomes `auto` after gateway tool results are appended; parallel-use settings remain unchanged |
+| `usage` | after hidden gateway rounds, the returned message (JSON) and the terminal `message_delta` (SSE) report the saturating sum of `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, and `cache_read_input_tokens` across every inference round, each streamed round being its `message_start.usage` overlaid by its `message_delta.usage`; a counter no round reported stays absent, other fields pass through from the final round, `message_start.usage` is the first round's snapshot, a single-round turn is unchanged, and a final round that omits `usage` still reports the hidden rounds' counters |
+
+vLLM may label a completed named tool call `end_turn`. The gateway accepts that stop only when the explicitly
+selected gateway tool appears in the round; streaming also requires `message_stop`. Rounds containing
+client-executed function tools return control to the client with `stop_reason: tool_use`, including when vLLM
+labels a completed call `end_turn`. The correction applies to JSON and the terminal streaming `message_delta`;
+gateway calls in a mixed round remain hidden. Truncation and other stop reasons retain their original meaning.
+
+For streaming requests using the built-in tool loop, every upstream round must end with `message_stop`
+before the gateway dispatches its tools or emits successful completion. EOF or `[DONE]` without that event
+produces an Anthropic SSE `error` (`api_error`), with no terminal `message_delta` or synthetic `message_stop`.
+Malformed JSON in an upstream SSE data payload also terminates the loop with `api_error` before tool dispatch
+or successful completion. The error does not echo upstream data. Well-formed unknown event types and SSE comments
+remain tolerated. Each started content block must receive `content_block_stop` before `message_stop`, including
+hidden built-in tool blocks. Otherwise the round fails before dispatch or successful completion. Full event-schema
+validation remains separate work. Block indexes must be non-negative integers and cannot be reused within a round;
+deltas and stops require an open block, so duplicate stops and post-stop deltas fail before dispatch or completion.
+`message_start` events require a non-empty string message ID, including in later rounds.
+Content and terminal events require a preceding `message_start` in each upstream round.
+Duplicate `message_start` events within one round fail before usage updates or tool dispatch;
+a new upstream start in a later tool round remains valid. Tool-use blocks require non-empty string IDs and names.
+Invalid identifiers fail before dispatch or completion, including in hidden built-in tool blocks.
+Already-streamed content remains partial. A valid `message_stop` still releases the upstream body immediately,
+without waiting for HTTP EOF. This completion gate does not yet validate every content-block transition;
+full lifecycle validation and aggregate resource limits remain tracked in #313. Pass-through requests are unchanged.
+
+A round that ends while a gateway call is present — a `max_tokens` truncation mid-call, or an `end_turn` the
+gateway does not accept as a tool stop — does not execute that call, and both transports keep it hidden. The
+client declared these tools for the gateway to run, so surfacing one would name a tool the client never agreed
+to execute.
+
+Gateway-tool requests parse `tool_choice` as a typed union with a required non-empty name for `tool`. Malformed
+selectors return HTTP 400 before inference. Known variants preserve parallel-use settings and extension fields;
+requests without gateway tools retain the transparent proxy path and upstream validation.
 
 The gateway-owned vs. client-owned split is already the tool framework's core model; Messages just uses Anthropic's block names in place of Responses item types. Beyond the table, the loop has to handle parallel tool calls (multiple `tool_use` blocks in one assistant turn, with all resulting `tool_result` blocks in a single user message), the full `stop_reason` set (`end_turn`, `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn`, `refusal` — where `pause_turn` means resend to continue), and streaming `tool_use` args arriving as `input_json_delta` partial-JSON frames. When it resolves a gateway-owned `tool_use` mid-stream it must emit correct `content_block_start` → `input_json_delta` → `content_block_stop` frames for surfaced calls, suppress the hidden ones, and keep block `index` contiguous.
 

@@ -153,7 +153,7 @@ async fn persist(
     ctx: &ExecutionContext,
 ) -> ExecutorResult<ResponsePayload> {
     let live = RequestContext::from(unseal(&context, &signing_key())?);
-    let payload = decode_upstream(&live, upstream)?;
+    let (payload, live) = decode_upstream(live, upstream).await?;
     commit(live, payload, ctx).await
 }
 
@@ -201,7 +201,7 @@ async fn assert_relayed_call_id_rejected(
     } else {
         UpstreamBody::Json(relayed)
     };
-    let error = persist(attempt.context, upstream, ctx).await.expect_err(case);
+    let error = Box::pin(persist(attempt.context, upstream, ctx)).await.expect_err(case);
     assert_eq!(status_of(&error), 400, "{case}: {error}");
     let message = error.to_string();
     assert!(
@@ -210,12 +210,12 @@ async fn assert_relayed_call_id_rejected(
     );
     assert!(!message.contains(marker), "{case}: leaked call_id: {message}");
 
-    let retry = function_call("fc_retry", "call_retry", "completed");
-    let corrected = persist(
+    let retry = function_call(&format!("fc_retry_{response_id}"), "call_retry", "completed");
+    let corrected = Box::pin(persist(
         retry_context,
         UpstreamBody::Json(&upstream_call_json(&retry, "completed")),
         ctx,
-    )
+    ))
     .await
     .unwrap_or_else(|error| panic!("{case} consumed {response_id}: {error}"));
     assert_eq!(corrected.id, response_id);
@@ -287,12 +287,12 @@ async fn a_function_call_stream_passes_strict_validation() {
 
 #[tokio::test]
 async fn relayed_json_tool_call_ids_are_validated_before_persistence() {
-    assert_relayed_tool_call_ids_are_validated(false).await;
+    Box::pin(assert_relayed_tool_call_ids_are_validated(false)).await;
 }
 
 #[tokio::test]
 async fn relayed_sse_tool_call_ids_are_validated_before_persistence() {
-    assert_relayed_tool_call_ids_are_validated(true).await;
+    Box::pin(assert_relayed_tool_call_ids_are_validated(true)).await;
 }
 
 async fn assert_relayed_tool_call_ids_are_validated(stream: bool) {
@@ -387,7 +387,7 @@ async fn assert_relayed_tool_call_ids_are_validated(stream: bool) {
         // the reserved response ID with a usable upstream response.
         let valid = json!({
             "id": "resp_retry", "status": "completed", "output": [{
-                "type": "custom_tool_call", "id": "ctc_retry", "call_id": "call_retry",
+                "type": "custom_tool_call", "id": format!("ctc_retry_{response_id}"), "call_id": "call_retry",
                 "name": "raw_echo", "input": "retry succeeded", "status": "completed"
             }]
         })
@@ -402,12 +402,12 @@ async fn assert_relayed_tool_call_ids_are_validated(stream: bool) {
 
 #[tokio::test]
 async fn relayed_json_call_id_cannot_reuse_continued_history() {
-    assert_relayed_call_id_cannot_reuse_continued_history(false).await;
+    Box::pin(assert_relayed_call_id_cannot_reuse_continued_history(false)).await;
 }
 
 #[tokio::test]
 async fn relayed_sse_call_id_cannot_reuse_continued_history() {
-    assert_relayed_call_id_cannot_reuse_continued_history(true).await;
+    Box::pin(assert_relayed_call_id_cannot_reuse_continued_history(true)).await;
 }
 
 async fn assert_relayed_call_id_cannot_reuse_continued_history(stream: bool) {

@@ -12,6 +12,8 @@ use tracing::warn;
 use crate::config::Config;
 use crate::error::Error;
 
+mod diagnostics;
+
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -51,6 +53,17 @@ pub struct ProxyRequest {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub query: Option<String>,
+}
+
+impl ProxyRequest {
+    /// Read only the transport preference while preserving the original request bytes.
+    #[must_use]
+    pub fn is_streaming(&self) -> bool {
+        serde_json::from_slice::<Value>(&self.body)
+            .ok()
+            .and_then(|value| value.get("stream")?.as_bool())
+            .unwrap_or(false)
+    }
 }
 
 /// Authentication fallback used when proxying a request to an upstream API.
@@ -110,7 +123,8 @@ impl ProxyState {
 ///
 /// Hop-by-hop and origin-specific headers are removed, all other headers stay
 /// open-ended, and the configured credential is injected only when the client
-/// did not supply one.
+/// did not supply one. W3C trace headers are replaced with the current gateway
+/// span's context; caller headers are never forwarded as the outbound parent.
 #[must_use]
 pub fn upstream_request_headers(headers: &HeaderMap, config: &Config, auth: ProxyAuth) -> reqwest::header::HeaderMap {
     let connection_options = connection_options(headers);
@@ -146,6 +160,7 @@ pub fn upstream_request_headers(headers: &HeaderMap, config: &Config, auth: Prox
         }
     }
 
+    crate::executor::telemetry::stages::inject_context(&mut out);
     out
 }
 
@@ -205,7 +220,7 @@ pub fn error_response_for_auth(status: StatusCode, code: &str, message: &str, au
         ProxyAuth::Anthropic => serde_json::json!({
             "type": "error",
             "error": {
-                "type": "api_error",
+                "type": if status == StatusCode::BAD_REQUEST { "invalid_request_error" } else { "api_error" },
                 "message": message,
             }
         }),
@@ -273,10 +288,14 @@ pub async fn proxy_request_with_path(
     auth: ProxyAuth,
     state: &ProxyState,
 ) -> ProxyResponse {
-    let is_streaming = serde_json::from_slice::<Value>(&request.body)
-        .ok()
-        .and_then(|v| v.get("stream")?.as_bool())
-        .unwrap_or(false);
+    let response_model = if path == "/v1/responses" {
+        serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|value| value.get("model").and_then(Value::as_str).map(str::to_owned))
+    } else {
+        None
+    };
+    let is_streaming = request.is_streaming();
 
     let llm_headers = upstream_request_headers(&request.headers, &state.config, auth);
 
@@ -313,10 +332,18 @@ pub async fn proxy_request_with_path(
 
         let byte_stream = llm_resp.bytes_stream().map_err(std::io::Error::other);
 
+        let body = if let Some(model) = response_model {
+            ProxyBody::Stream(Box::pin(diagnostics::observe_response_stream(
+                byte_stream,
+                diagnostics::ResponseStreamObserver::new(model, status.as_u16()),
+            )))
+        } else {
+            ProxyBody::Stream(Box::pin(byte_stream))
+        };
         return ProxyResponse {
             status,
             headers: response_headers,
-            body: ProxyBody::Stream(Box::pin(byte_stream)),
+            body,
         };
     }
 
@@ -356,6 +383,7 @@ mod tests {
             postgres: crate::config::PostgresConfig::default(),
             sqlite: crate::config::SqliteConfig::default(),
             tools: crate::config::ToolRuntimeConfig::default(),
+            responses: crate::config::ResponsesConfig::default(),
         }
     }
 

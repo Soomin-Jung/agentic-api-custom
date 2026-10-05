@@ -14,7 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentic_core::executor::{
-    ConversationHandler, ExecutionContext, ExecutorResult, MessagesUpstream, ResponseHandler, run_messages_loop,
+    ConversationHandler, ExecutionContext, ExecutorResult, MessagesRequestContext, MessagesUpstream, ResponseHandler,
+    run_messages_loop,
 };
 use agentic_core::storage::{ConversationStore, ResponseStore};
 use agentic_core::tool::{ToolRegistry, WebSearchHandler};
@@ -205,9 +206,14 @@ async fn run_test_messages_loop(
     exec_ctx: &ExecutionContext,
 ) -> ExecutorResult<Value> {
     let upstream = MessagesUpstream::new(&exec_ctx.llm_base_url, None, reqwest::header::HeaderMap::new());
-    run_messages_loop(request, registry, exec_ctx, &upstream)
-        .await
-        .map(|response| response.body)
+    run_messages_loop(
+        MessagesRequestContext::from_value(request)?,
+        registry,
+        exec_ctx,
+        &upstream,
+    )
+    .await
+    .map(|response| response.body)
 }
 
 fn web_search_request() -> Value {
@@ -289,7 +295,8 @@ async fn native_web_search_applies_domain_and_location_configuration() {
     let registry = build_tool_registry(&tools, &exec_ctx).await;
 
     let transport = MessagesUpstream::new(&exec_ctx.llm_base_url, None, reqwest::header::HeaderMap::new());
-    run_messages_loop(request, &registry, &exec_ctx, &transport)
+    let ctx = MessagesRequestContext::from_value(request).expect("request context");
+    run_messages_loop(ctx, &registry, &exec_ctx, &transport)
         .await
         .expect("loop runs");
 
@@ -316,7 +323,8 @@ async fn native_web_search_applies_blocked_domains() {
     let registry = build_tool_registry(&tools, &exec_ctx).await;
 
     let transport = MessagesUpstream::new(&exec_ctx.llm_base_url, None, reqwest::header::HeaderMap::new());
-    run_messages_loop(request, &registry, &exec_ctx, &transport)
+    let ctx = MessagesRequestContext::from_value(request).expect("request context");
+    run_messages_loop(ctx, &registry, &exec_ctx, &transport)
         .await
         .expect("loop runs");
 
@@ -351,7 +359,8 @@ async fn native_web_search_enforces_max_uses() {
     let registry = build_tool_registry(&tools, &exec_ctx).await;
 
     let transport = MessagesUpstream::new(&exec_ctx.llm_base_url, None, reqwest::header::HeaderMap::new());
-    run_messages_loop(request, &registry, &exec_ctx, &transport)
+    let ctx = MessagesRequestContext::from_value(request).expect("request context");
+    run_messages_loop(ctx, &registry, &exec_ctx, &transport)
         .await
         .expect("loop runs");
 
@@ -367,6 +376,170 @@ async fn native_web_search_enforces_max_uses() {
     assert_eq!(results[0]["is_error"], false);
     assert_eq!(results[1]["is_error"], true);
     assert!(results[1]["content"].as_str().unwrap_or_default().contains("max_uses"));
+}
+
+fn search_call(id: &str, input: Value) -> Value {
+    let mut call = serde_json::json!({"type": "tool_use", "id": id, "name": "web_search"});
+    call["input"] = input;
+    call
+}
+
+/// Run one native web-search request whose model turns are `turns` (each a list
+/// of `tool_use` blocks) followed by a final answer. Returns the queries the
+/// search backend received, sorted, and for every tool round the error text of
+/// each fed-back result (`None` for a search that ran).
+async fn native_search_outcomes(
+    max_uses: Option<u64>,
+    turns: &[Vec<Value>],
+) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    let mut bodies: Vec<Value> = turns
+        .iter()
+        .map(|calls| {
+            serde_json::json!({
+                "id": "m", "type": "message", "role": "assistant", "model": "qwen3", "content": calls,
+                "stop_reason": "tool_use", "usage": {"input_tokens": 5, "output_tokens": 3}
+            })
+        })
+        .collect();
+    bodies.push(serde_json::json!({
+        "id": "done", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "text", "text": "Done."}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}
+    }));
+    let (vllm_url, upstream, _v) = spawn_mock_vllm_messages(bodies).await;
+    let (search_url, mut captured, _s) = spawn_mock_search().await;
+    let exec_ctx = build_exec_ctx(&vllm_url, &search_url).await;
+    let mut request = serde_json::json!({
+        "model": "qwen3", "max_tokens": 1024, "stream": false,
+        "messages": [{"role": "user", "content": "Search."}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+    });
+    if let Some(max_uses) = max_uses {
+        request["tools"][0]["max_uses"] = max_uses.into();
+    }
+    let tools: Vec<ToolParam> = serde_json::from_value(request["tools"].clone()).unwrap();
+    let registry = build_tool_registry(&tools, &exec_ctx).await;
+
+    let message = run_test_messages_loop(request, &registry, &exec_ctx)
+        .await
+        .expect("loop runs");
+    assert_eq!(message["content"][0]["text"], "Done.");
+
+    let mut searched = Vec::new();
+    while let Ok(search) = captured.try_recv() {
+        searched.push(search.body["query"].as_str().expect("query").to_owned());
+    }
+    searched.sort();
+    let requests = upstream.requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        turns.len() + 1,
+        "one inference follows every tool round"
+    );
+    let outcomes = requests[1..]
+        .iter()
+        .map(|request| {
+            request["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .and_then(|message| message["content"].as_array())
+                .expect("tool results fed back")
+                .iter()
+                .map(|result| {
+                    result["is_error"]
+                        .as_bool()
+                        .expect("is_error")
+                        .then(|| result["content"].as_str().expect("error text").to_owned())
+                })
+                .collect()
+        })
+        .collect();
+    (searched, outcomes)
+}
+
+const MAX_USES_EXCEEDED: &str = "web_search max_uses exceeded; search was not run";
+
+/// `max_uses` limits the searches performed, so a batched call is charged for
+/// every query. A call the remaining budget cannot cover is refused whole and
+/// leaves the budget for a later call that fits, in this round or the next.
+#[tokio::test]
+async fn native_web_search_max_uses_counts_every_batched_query() {
+    let (searched, outcomes) = native_search_outcomes(
+        Some(2),
+        &[
+            vec![
+                search_call("t1", serde_json::json!({"queries": ["a one", "a two", "a three"]})),
+                search_call("t2", serde_json::json!({"query": "b one"})),
+                search_call("t3", serde_json::json!({"queries": ["c one", "c two"]})),
+            ],
+            vec![search_call("t4", serde_json::json!({"query": "d one"}))],
+            vec![search_call("t5", serde_json::json!({"query": "e one"}))],
+        ],
+    )
+    .await;
+
+    assert_eq!(searched, ["b one", "d one"], "max_uses=2 allows exactly two searches");
+    let exceeded = Some(MAX_USES_EXCEEDED.to_owned());
+    assert_eq!(
+        outcomes,
+        [
+            vec![exceeded.clone(), None, exceeded.clone()],
+            vec![None],
+            vec![exceeded]
+        ]
+    );
+}
+
+/// A call with malformed arguments performs no search, so it must not use up
+/// the budget of one that can run.
+#[tokio::test]
+async fn native_web_search_malformed_calls_do_not_use_the_budget() {
+    let (searched, outcomes) = native_search_outcomes(
+        Some(1),
+        &[vec![
+            search_call("t1", serde_json::json!({"queries": []})),
+            search_call("t2", serde_json::json!("not an object")),
+            search_call("t3", serde_json::json!({"query": "kept"})),
+        ]],
+    )
+    .await;
+
+    assert_eq!(searched, ["kept"]);
+    assert_eq!(
+        outcomes,
+        [vec![
+            Some(
+                "tool execution failed: invalid tool config: web_search requires a non-empty query or queries"
+                    .to_owned()
+            ),
+            Some("invalid tool arguments (not a JSON object); tool was not run".to_owned()),
+            None
+        ]]
+    );
+}
+
+/// Controls: a batch the budget covers runs in full, and a request without
+/// `max_uses` is not limited.
+#[tokio::test]
+async fn native_web_search_budget_admits_what_fits() {
+    let (searched, outcomes) = native_search_outcomes(
+        Some(3),
+        &[vec![search_call("t1", serde_json::json!({"queries": ["a", "b", "c"]}))]],
+    )
+    .await;
+    assert_eq!(searched, ["a", "b", "c"]);
+    assert_eq!(outcomes, [vec![None]]);
+
+    let (searched, outcomes) = native_search_outcomes(
+        None,
+        &[vec![
+            search_call("t1", serde_json::json!({"queries": ["a", "b", "c", "d", "e"]})),
+            search_call("t2", serde_json::json!({"query": "f"})),
+        ]],
+    )
+    .await;
+    assert_eq!(searched, ["a", "b", "c", "d", "e", "f"]);
+    assert_eq!(outcomes, [vec![None, None]]);
 }
 
 // ── Repro tests for Maral's #131 review (currently FAILING — proves each bug) ──
@@ -483,6 +656,11 @@ async fn messages_loop_returns_immediately_when_model_does_not_call_tool() {
     assert_eq!(calls, 1, "one round only");
     assert_eq!(result["stop_reason"], "end_turn");
     assert_eq!(result["content"][0]["text"], "Rust 1.89.0.");
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({"input_tokens": 5, "output_tokens": 3}),
+        "a single round's usage is returned unchanged"
+    );
 }
 
 // E7: a client-owned tool_use in the turn must be returned to the client (the
@@ -507,6 +685,155 @@ async fn messages_loop_returns_client_owned_tool_use_to_client() {
         result["content"][0]["name"], "get_weather",
         "client tool_use surfaces to the client"
     );
+}
+
+fn gateway_round_body(usage: &Value) -> Value {
+    serde_json::json!({
+        "id": "m1", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "tool_use", "id": "t1", "name": "web_search", "input": {"query": "rust"}}],
+        "stop_reason": "tool_use", "usage": usage
+    })
+}
+
+// Part of #315: the hidden gateway round's usage is folded into the returned
+// message whether the turn ends in text or hands a client tool_use back. Cache
+// counters reported by one round survive, and non-counter fields pass through
+// from the final round.
+#[tokio::test]
+async fn messages_loop_reports_usage_of_every_gateway_round() {
+    let first = gateway_round_body(&serde_json::json!({
+        "input_tokens": 10, "output_tokens": 4, "cache_read_input_tokens": 128, "service_tier": "standard"
+    }));
+    let text = serde_json::json!({
+        "id": "m2", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "text", "text": "Rust 1.89.0."}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 20, "output_tokens": 6, "server_tool_use": {"web_search_requests": 0}}
+    });
+    let (result, calls) = run_against(vec![first.clone(), text], web_search_request()).await;
+    assert_eq!(calls, 2, "tool round + final round");
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({
+            "input_tokens": 30, "output_tokens": 10, "cache_read_input_tokens": 128,
+            "server_tool_use": {"web_search_requests": 0}
+        })
+    );
+
+    let client_call = serde_json::json!({
+        "id": "m2", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "tool_use", "id": "t2", "name": "get_weather", "input": {"city": "SF"}}],
+        "stop_reason": "tool_use", "usage": {"input_tokens": 20, "output_tokens": 6}
+    });
+    let mut request = web_search_request();
+    request["tools"] = serde_json::json!([
+        {"name": "web_search", "description": "s", "input_schema": {"type": "object"}},
+        {"name": "get_weather", "description": "w", "input_schema": {"type": "object"}}
+    ]);
+    let (result, calls) = run_against(vec![first, client_call], request).await;
+    assert_eq!(calls, 2, "tool round + client tool_use round");
+    assert_eq!(result["stop_reason"], "tool_use");
+    assert_eq!(result["content"][0]["name"], "get_weather");
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({"input_tokens": 30, "output_tokens": 10, "cache_read_input_tokens": 128})
+    );
+}
+
+// A final round that omits `usage` must not erase the hidden round's cost;
+// a single round without `usage` stays exactly as the upstream sent it.
+#[tokio::test]
+async fn messages_loop_reports_hidden_round_usage_when_the_final_round_omits_it() {
+    let first = gateway_round_body(&serde_json::json!({"input_tokens": 10, "output_tokens": 4}));
+    let text = serde_json::json!({
+        "id": "m2", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "text", "text": "Rust 1.89.0."}], "stop_reason": "end_turn"
+    });
+    let (result, calls) = run_against(vec![first, text.clone()], web_search_request()).await;
+    assert_eq!(calls, 2, "tool round + final round");
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({"input_tokens": 10, "output_tokens": 4})
+    );
+
+    let (result, calls) = run_against(vec![text], web_search_request()).await;
+    assert_eq!(calls, 1, "one round only");
+    assert!(
+        result.get("usage").is_none(),
+        "no usage is invented for a single round: {result}"
+    );
+}
+
+fn native_web_search_request() -> Value {
+    serde_json::json!({
+        "model": "qwen3", "max_tokens": 1024, "stream": false,
+        "messages": [{"role": "user", "content": "What is the latest stable Rust release?"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+    })
+}
+
+// A round that ends while a gateway call is present must not expose that call.
+// The client declared `web_search` as a server tool, so a surfaced `tool_use`
+// names a tool it never agreed to run. Truncation is the realistic trigger: the
+// model began a search and hit the token limit, so the call is not executed.
+#[tokio::test]
+async fn messages_loop_hides_a_gateway_call_on_a_terminal_round() {
+    for stop in [
+        "max_tokens",
+        "stop_sequence",
+        "pause_turn",
+        "refusal",
+        "surprise_future_stop",
+    ] {
+        let truncated = serde_json::json!({
+            "id": "m1", "type": "message", "role": "assistant", "model": "qwen3",
+            "content": [
+                {"type": "text", "text": "Let me look that up."},
+                {"type": "tool_use", "id": "t1", "name": "web_search", "input": {"query": "rust"}}
+            ],
+            "stop_reason": stop, "usage": {"input_tokens": 10, "output_tokens": 4}
+        });
+        let (result, calls) = run_against(vec![truncated], native_web_search_request()).await;
+        assert_eq!(calls, 1, "{stop}: the round is terminal, so the loop runs once");
+        let content = result["content"].as_array().unwrap();
+        assert!(
+            !content.iter().any(|block| block["type"] == "tool_use"),
+            "{stop}: gateway tool_use surfaced to the client: {content:?}"
+        );
+        assert_eq!(content.len(), 1, "{stop}: the visible blocks survive: {content:?}");
+        assert_eq!(content[0]["text"], "Let me look that up.");
+        assert_eq!(result["stop_reason"], stop, "{stop}: the terminal reason is unchanged");
+        assert_eq!(
+            result["usage"],
+            serde_json::json!({"input_tokens": 10, "output_tokens": 4}),
+            "{stop}: a single round's usage is unchanged"
+        );
+    }
+}
+
+// vLLM labels a completed, explicitly named call `end_turn`, and the loop
+// accepts that stop only when `tool_choice` selected the gateway tool. Any other
+// `end_turn` that still carries a gateway call — here `tool_choice` is unset —
+// is terminal, so the call is not executed and must stay hidden.
+#[tokio::test]
+async fn messages_loop_hides_an_unexecuted_gateway_call_labelled_end_turn() {
+    let body = serde_json::json!({
+        "id": "m1", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "tool_use", "id": "t1", "name": "web_search", "input": {"query": "rust"}}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 10, "output_tokens": 4}
+    });
+    let (result, calls) = run_against(vec![body], native_web_search_request()).await;
+    assert_eq!(
+        calls, 1,
+        "the loop does not execute a call it does not accept as a tool stop"
+    );
+    let content = result["content"].as_array().unwrap();
+    assert!(
+        !content.iter().any(|block| block["type"] == "tool_use"),
+        "gateway tool_use surfaced to the client: {content:?}"
+    );
+    assert!(content.is_empty(), "the hidden call was the only block: {content:?}");
+    assert_eq!(result["stop_reason"], "end_turn", "the terminal reason is unchanged");
 }
 
 // Multi-round (3 rounds): replay the live-recorded sequential cassette
@@ -534,6 +861,13 @@ async fn messages_loop_multi_round_sequential() {
     let content = result["content"].as_array().unwrap();
     assert!(!content.iter().any(|b| b["type"] == "tool_use"), "gateway tools hidden");
     assert_eq!(result["stop_reason"], "end_turn");
+    // Part of #315: the recording's rounds cost 196+6479+10291 input and
+    // 352+880+427 output tokens; the client sees the whole turn, not round 3.
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({"input_tokens": 16966, "output_tokens": 1659}),
+        "usage sums every round"
+    );
 }
 
 // Parallel: replay the live-recorded parallel cassette (two tool_use blocks in
@@ -566,6 +900,12 @@ async fn messages_loop_parallel_tool_use() {
         .filter(|b| b["type"] == "tool_result")
         .count();
     assert_eq!(tool_results, 2, "both parallel tool_results fed back");
+    // Part of #315: 172+10609 input and 459+331 output tokens across both rounds.
+    assert_eq!(
+        result["usage"],
+        serde_json::json!({"input_tokens": 10781, "output_tokens": 790}),
+        "usage sums the tool round and the final round"
+    );
 }
 
 // E5: a gateway tool that fails to dispatch (search backend returns 500) becomes
@@ -769,4 +1109,84 @@ async fn messages_loop_preserves_claude_code_cache_control_across_rounds() {
         serde_json::json!({"type": "ephemeral", "ttl": "1h"})
     );
     assert!(requests[1]["tools"][0].get("cache_control").is_none());
+}
+
+/// The dual-view context exists so the upstream body stays the client's own
+/// JSON. A typed round-trip through `MessagesRequest` would not: `ContentBlock`
+/// models only the fields the gateway reads and catches everything else in
+/// `#[serde(other)] Unknown`, which re-serializes as a literal
+/// `{"type":"unknown"}` block. This locks in that the raw body — not the typed
+/// view — is what reaches vLLM, across a gateway round.
+#[tokio::test]
+async fn messages_loop_preserves_unmodeled_blocks_and_tool_result_fields_across_rounds() {
+    let round0 = serde_json::json!({
+        "id": "m", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "tool_use", "id": "t2", "name": "WebSearch", "input": {"query": "rust"}}],
+        "stop_reason": "tool_use", "usage": {"input_tokens": 5, "output_tokens": 3}
+    });
+    let round1 = serde_json::json!({
+        "id": "m2", "type": "message", "role": "assistant", "model": "qwen3",
+        "content": [{"type": "text", "text": "Done."}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 5, "output_tokens": 3}
+    });
+    let (vllm_url, upstream, _v) = spawn_mock_vllm_messages(vec![round0, round1]).await;
+    let (search_url, _search_requests, _s) = spawn_mock_search().await;
+    let mut exec_ctx = build_exec_ctx(&vllm_url, &search_url).await;
+    exec_ctx.messages_gateway_tools = GatewayToolMap::from_pairs([("WebSearch", "web_search")]);
+
+    // Every block here is either unmodeled by `ContentBlock` (`image`,
+    // `redacted_thinking`) or carries fields it does not model (`citations`,
+    // `is_error`, `cache_control`, a non-text `tool_result` part).
+    let request = serde_json::json!({
+        "model": "qwen3", "max_tokens": 1024, "stream": false,
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?",
+                 "citations": [{"type": "web_search_result_location", "url": "https://example.com"}]},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": "encrypted-blob"},
+                {"type": "tool_use", "id": "t1", "name": "WebSearch", "input": {"query": "prior"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
+                 "content": [
+                     {"type": "text", "text": "search failed"},
+                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "BBBB"}}
+                 ]}
+            ]}
+        ],
+        "tools": [{"name": "WebSearch", "description": "Search the web",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}}}]
+    });
+    let original_messages = request["messages"].clone();
+    let tools: Vec<ToolParam> = serde_json::from_value(request["tools"].clone()).unwrap();
+    let registry = build_tool_registry(&tools, &exec_ctx).await;
+
+    let result = run_test_messages_loop(request, &registry, &exec_ctx).await.unwrap();
+    assert_eq!(result["stop_reason"], "end_turn");
+
+    let requests = upstream.requests.lock().await;
+    assert_eq!(requests.len(), 2, "tool round + final round");
+    for upstream_request in requests.iter() {
+        let messages = upstream_request["messages"].as_array().expect("messages");
+        assert_eq!(
+            &messages[..3],
+            original_messages.as_array().unwrap().as_slice(),
+            "the client's own blocks reach upstream untouched"
+        );
+        // The failure mode a typed round-trip would introduce.
+        let rendered = serde_json::to_string(upstream_request).unwrap();
+        assert!(
+            !rendered.contains(r#""type":"unknown""#),
+            "no block collapsed to Unknown"
+        );
+    }
+    // Round 2 carries the appended gateway turn on top of the untouched prefix.
+    let round_two = requests[1]["messages"].as_array().expect("messages");
+    assert_eq!(round_two.len(), 5, "3 client turns + assistant turn + tool_result turn");
+    assert_eq!(round_two[3]["content"][0]["id"], "t2");
+    assert_eq!(round_two[4]["content"][0]["type"], "tool_result");
 }

@@ -1,5 +1,10 @@
 # Design: Codex CLI Integration
 
+> **Desktop setup:** See [Codex Desktop with local models](../guides/codex-desktop.md) for the tested Linux launch
+> configuration. The native custom-tool forwarding described below does not match the current custom-tool
+> normalization path, which rejects grammar-constrained declarations. The desktop guide documents the
+> `apply_patch` workaround verified with Codex 0.153.4.
+
 > **References:** [Issue #54](https://github.com/vllm-project/agentic-api/issues/54),
 > [PR #67](https://github.com/vllm-project/agentic-api/pull/67)
 > **Owner:** @haoshan98 for Codex compatibility. Latest `main` owns the shared tool framework lineage from PR #67.
@@ -138,7 +143,8 @@ Responses tool shapes and execution semantics, so it can be always on.
 | `custom` | Client-executed custom tool. Preserve its opaque format and forward it natively. |
 | `web_search_preview` | Gateway-executed built-in tool normalized to the web-search function tool. Without a usable provider, execution produces a failed tool result instead of returning the call for client execution. |
 | `mcp` | Gateway-executed built-in tool. Normalize discovered MCP tools to model-visible function tools, execute calls with request-scoped MCP bindings, and expose public `mcp_call` items. Streaming emits `response.output_item.added`, `response.mcp_call.in_progress`, `response.mcp_call_arguments.delta`/`.done`, `response.mcp_call.completed` or `.failed`, and `response.output_item.done`. |
-| `file_search`, `code_interpreter` | Accepted by the typed request parser but skipped during upstream normalization because no gateway handler is registered yet. |
+| `file_search` | Accepted by the typed request parser but skipped during upstream normalization because no gateway handler is registered yet. |
+| `code_interpreter` | Gateway-executed when the binary includes `embedded-code-interpreter` and the operator enables a ready Eryx runtime; otherwise the declaration is rejected before inference. |
 | Unknown tool | Recognized and skipped on the typed path; opaque fields are not preserved or executed. Eligible raw-proxy requests remain byte-transparent. |
 
 For response items:
@@ -149,6 +155,7 @@ For response items:
 | `custom_tool_call` | Preserve raw `input`; return it to Codex for local execution. |
 | `web_search_call` | Result from the gateway-executed web-search tool. |
 | `mcp_call` | Result from a gateway-executed MCP tool with `server_label`, discovered tool `name`, JSON-string `arguments`, and `status`; successful calls contain `output`, while failures contain a structured `mcp_tool_execution_error`. |
+| `code_interpreter_call` | Result from the opt-in gateway-executed Eryx tool, with the executed code, status, and bounded retained logs. |
 | Unknown output item | Recognized as an unknown unit variant on the typed path; opaque fields are not preserved or executed. |
 
 ---
@@ -301,6 +308,67 @@ model-catalog refresh still attached the saved OpenAI/ChatGPT bearer credential 
 preserves client authorization headers by design, so the upstream rejected that incidental credential. The isolated
 `CODEX_HOME` above avoids the credential path for this smoke test. Do not copy or forward the credential shown in the
 diagnostic, and rotate it if it was reusable.
+
+---
+
+## Image Capability Resolution
+
+Codex decides whether a request may carry image content by reading its **local** model catalog. When the entry for the
+selected model does not list `image` in `input_modalities`, Codex strips image content client-side and sends a
+placeholder instead. A vision-capable upstream is therefore not enough on its own: the catalog Codex reads has to say
+the model accepts images.
+
+Two catalogs exist and they must agree:
+
+| Catalog | Produced by | Consumed by |
+|---|---|---|
+| `GET /v1/models?client_version=<ver>` | `handler/http/models.rs` | Codex refreshing its model list, and both `agentic` launchers |
+| `$CODEX_HOME/model_catalog.json` | `agentic_harness::prepare_codex_home` (and `scripts/agentic-codex.sh`) | Codex reading an isolated session home |
+
+### Resolution order
+
+The gateway resolves `input_modalities` for every served model in this order:
+
+1. An explicit `[models."<served-model-id>"] input_modalities` override in `~/.agentic-api/config.toml`.
+2. Recognized upstream metadata: `capabilities: ["image"]` on the upstream `/v1/models` entry.
+3. A conservative text-only fallback.
+
+An explicit `["text"]` override wins over upstream image metadata, which is how a vision model gets pinned to text.
+Capabilities are never inferred from a model name — an unrecognized capability string such as `vision` or `multimodal`
+resolves to text-only. `supports_image_detail_original` stays `false`: the gateway does not relay image detail hints.
+
+### How the launchers stay consistent
+
+`agentic run codex` and `agentic harness codex` both fetch `GET {gateway}/v1/models?client_version=<ver>` before
+writing the isolated home, and take the selected model **and** its modalities from that one response. The client
+version is read from the Codex binary itself (`codex --version`, honoring `AGENTIC_CODEX_BIN`); set
+`AGENTIC_CODEX_CLIENT_VERSION` to skip the probe where it cannot run. Only the modalities are copied — the isolated
+catalog keeps its launcher-specific settings (`shell_type: "local"`, an omitted `apply_patch_tool_type`, and a
+token-based truncation policy), which intentionally differ from the HTTP catalog.
+
+`scripts/agentic-codex.sh` copies the gateway catalog verbatim, so it inherits the resolved modalities with no change.
+
+### Failure behavior
+
+A launcher never writes a catalog it could not verify. If the gateway cannot be reached, rejects the request, returns
+an undecodable catalog, or does not list the selected model, the launch fails with an actionable error instead of
+writing text-only metadata:
+
+- Transport errors, `5xx`, `408`, `425`, `429`, and an empty catalog are retried until the readiness budget expires
+  (`--llm-ready-timeout-s`/`--llm-ready-interval-s`; 30s/250ms when attaching to a running gateway).
+- `401`/`403` fail immediately with a hint to pass `--api-key`. **A gateway behind OIDC now requires a credential for
+  `agentic harness codex`**, because `/v1/models` is a protected route.
+- A served, non-empty catalog that does not list the selected model is retried for 10 seconds and then fails, naming
+  the models the gateway does serve. A catalog listing other models proves the upstream is warm, so a missing model is
+  treated as a configuration error rather than a cold start.
+- Catalog responses larger than 1 MiB are rejected.
+
+### Regenerating existing session homes
+
+`agentic run` and `agentic harness` create a fresh session home per invocation, so they pick up resolved modalities
+automatically. A persistent home does not: delete and regenerate any `model_catalog.json` written before this change
+(for example a directory pinned with `AGENTIC_CODEX_HOME`, or a hand-written `-c model_catalog_json=...` file), or
+Codex will keep reading the stale text-only entry.
 
 ---
 

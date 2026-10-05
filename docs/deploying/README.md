@@ -388,7 +388,7 @@ its data directory lives on the PersistentVolumeClaim.
 ## Optional web search
 
 To enable the gateway-executed `web_search` built-in tool, add the provider settings
-to the Deployment’s container environment:
+to the Deployment’s container environment. The default provider is You.com:
 
 ```yaml
             - name: YOU_API_KEY
@@ -408,6 +408,43 @@ Create the secret before applying the Deployment:
 ```console
 kubectl create secret generic agentic-api-secrets \
   --from-literal=you-api-key="$YOU_API_KEY"
+```
+
+To use Brave Search instead, select the provider and supply its key; the endpoint
+defaults to `https://api.search.brave.com`, and batched queries run one at a time
+unless `AGENTIC_WEB_SEARCH_MAX_CONCURRENT_QUERIES` raises the ceiling for a paid plan:
+
+```yaml
+            - name: AGENTIC_WEB_SEARCH_PROVIDER
+              value: brave
+            - name: BRAVE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-api-secrets
+                  key: brave-api-key
+```
+
+```console
+kubectl create secret generic agentic-api-secrets \
+  --from-literal=brave-api-key="$BRAVE_API_KEY"
+```
+
+To use Tavily instead, select the provider and supply its key; the endpoint defaults
+to `https://api.tavily.com` and batched queries inherit the gateway concurrency limit:
+
+```yaml
+            - name: AGENTIC_WEB_SEARCH_PROVIDER
+              value: tavily
+            - name: TAVILY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentic-api-secrets
+                  key: tavily-api-key
+```
+
+```console
+kubectl create secret generic agentic-api-secrets \
+  --from-literal=tavily-api-key="$TAVILY_API_KEY"
 ```
 
 Do not commit API keys to the manifest or source tree.

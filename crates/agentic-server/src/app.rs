@@ -1,10 +1,14 @@
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::middleware;
 use axum::routing::{get, post};
+use axum::serve::{Listener, ListenerExt as _};
 use http::HeaderValue;
+use tokio::net::{TcpListener, TcpStream};
 #[cfg(debug_assertions)]
 use tokio::sync::oneshot;
 use tokio::sync::{Notify, Semaphore, SemaphorePermit};
@@ -14,10 +18,20 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use agentic_core::executor::ExecutionContext;
 use agentic_core::proxy::ProxyState;
 
+use crate::auth::api_key::require_api_key;
 use crate::auth::{ANTHROPIC_COUNT_TOKENS_PATH, ANTHROPIC_MESSAGES_PATH, OidcAuthenticator, require_oidc};
 use crate::handler::{
-    compact_response, conversations, count_tokens, health, messages, models, ready, responses, responses_ws_with_auth,
+    chat_completions, compact_response, completions, count_tokens, create_conversation, create_item,
+    delete_conversation, delete_item, health, list_items, messages, models, ready, responses, responses_ws_with_auth,
+    retrieve_conversation, retrieve_item, retrieve_response, update_conversation,
 };
+use crate::model_capabilities::ModelCapabilities;
+use crate::telemetry::http::{HttpMetrics, track_request};
+
+/// Default ceiling on serialized inbound request bytes for HTTP bodies and
+/// WebSocket messages.
+pub const DEFAULT_MAX_REQUEST_BODY_SIZE: NonZeroUsize =
+    NonZeroUsize::new(10 * 1024 * 1024).expect("default is nonzero");
 
 #[derive(Clone, Default)]
 pub struct WebSocketTracker {
@@ -172,6 +186,10 @@ impl Drop for WebSocketGuard {
 /// Server-level configuration read from environment variables.
 pub struct ServerConfig {
     pub cors_allowed_origins: Vec<String>,
+    /// Serve `/openapi.json` and `/swagger-ui` on the public router.
+    /// Controlled by `ENABLE_OPENAPI_DOCS=true`; disabled by default.
+    #[cfg(feature = "openapi")]
+    pub enable_openapi_docs: bool,
 }
 
 impl ServerConfig {
@@ -187,7 +205,14 @@ impl ServerConfig {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        Self { cors_allowed_origins }
+        #[cfg(feature = "openapi")]
+        let enable_openapi_docs =
+            std::env::var("ENABLE_OPENAPI_DOCS").is_ok_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+        Self {
+            cors_allowed_origins,
+            #[cfg(feature = "openapi")]
+            enable_openapi_docs,
+        }
     }
 
     fn cors_layer(&self) -> CorsLayer {
@@ -231,8 +256,38 @@ pub struct AppState {
     /// Whether `/ready` should omit the upstream health check.
     pub skip_llm_ready_check: bool,
     /// Server-configured API key; used as fallback when the request carries no
-    /// `Authorization` header on the executor path.
+    /// `Authorization` header on the executor path. Also authenticates local response
+    /// retrieval when OIDC is disabled.
     pub openai_api_key: Option<String>,
+    /// Configured per-model input-modality overrides applied to the Codex model catalog.
+    pub model_capabilities: Arc<ModelCapabilities>,
+    /// Ceiling on serialized inbound request bytes, applied uniformly to every
+    /// request-bearing endpoint and to WebSocket messages and frames.
+    ///
+    /// This bounds the encoded request — JSON overhead, replayed conversation
+    /// history, and base64 image attachments included — and is unrelated to the
+    /// upstream token context limit. One gateway-wide value keeps `/v1/messages`,
+    /// which carries the same inline attachments as `/v1/responses`, aligned with
+    /// it; `/v1/conversations` bodies are small enough that a raised ceiling has
+    /// no effect on them.
+    pub max_request_body_size: NonZeroUsize,
+}
+
+/// The gateway's listener: `listener` with Nagle's algorithm disabled on
+/// every accepted connection.
+///
+/// Streamed responses and WebSocket turns are written as several small
+/// frames. With Nagle's algorithm on, each frame after the first waits until
+/// the client acknowledges the previous one, and clients delay that
+/// acknowledgement (about 40 ms on Linux), which stalled every streamed
+/// response and WebSocket turn. A connection whose option cannot be set is
+/// still served.
+pub fn gateway_listener(listener: TcpListener) -> impl Listener<Io = TcpStream, Addr = SocketAddr> {
+    listener.tap_io(|stream: &mut TcpStream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "failed to disable Nagle's algorithm on an accepted connection");
+        }
+    })
 }
 
 pub fn build_router(state: AppState, server_config: &ServerConfig) -> Router {
@@ -245,13 +300,43 @@ pub fn build_router_with_auth(
     authenticator: Option<OidcAuthenticator>,
 ) -> Router {
     let public_routes = Router::new().route("/health", get(health)).route("/ready", get(ready));
+    #[cfg(feature = "openapi")]
+    let public_routes = if server_config.enable_openapi_docs {
+        public_routes.merge(crate::openapi::swagger_ui_router())
+    } else {
+        public_routes
+    };
+    // Retrieval reads local storage, so it cannot rely on upstream credential validation.
+    let mut retrieval_route = get(retrieve_response);
+    if authenticator.is_none()
+        && let Some(key) = state.openai_api_key.as_ref().filter(|key| !key.is_empty())
+    {
+        retrieval_route = retrieval_route.route_layer(middleware::from_fn_with_state(key.clone(), require_api_key));
+    }
     let protected_routes = Router::new()
-        .route("/v1/conversations", post(conversations))
+        .route("/v1/conversations", post(create_conversation))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(retrieve_conversation)
+                .post(update_conversation)
+                .delete(delete_conversation),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            post(create_item).get(list_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(retrieve_item).delete(delete_item),
+        )
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .route("/v1/models", get(models))
         .route(ANTHROPIC_MESSAGES_PATH, post(messages))
         .route(ANTHROPIC_COUNT_TOKENS_PATH, post(count_tokens))
         .route("/v1/responses", post(responses).get(responses_ws_with_auth))
-        .route("/v1/responses/compact", post(compact_response));
+        .route("/v1/responses/compact", post(compact_response))
+        .route("/v1/responses/{response_id}", retrieval_route);
     let protected_routes = match authenticator {
         Some(authenticator) => {
             protected_routes.route_layer(middleware::from_fn_with_state(authenticator, require_oidc))
@@ -262,5 +347,11 @@ pub fn build_router_with_auth(
     public_routes
         .merge(protected_routes)
         .layer(server_config.cors_layer())
+        // Outermost: sees every request after routing, including rejected ones,
+        // and holds the server span open across the whole response body.
+        .layer(middleware::from_fn_with_state(
+            HttpMetrics::from_global(),
+            track_request,
+        ))
         .with_state(state)
 }

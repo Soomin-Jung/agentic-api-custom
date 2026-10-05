@@ -27,6 +27,8 @@ This repository is Rust-first under the `vllm-project` GitHub organization.
 ├── TERMINOLOGY.md              # Normative project vocabulary
 ├── crates/agentic-server/       # Axum binary, transport handlers, and configuration
 ├── crates/agentic-server-core/  # Protocol types, execution, tools, and persistence
+├── crates/agentic-llm-d/        # Split-execution state backend for the llm-d coordinator
+├── crates/agentic-cli-docs/     # Build-time generator for the CLI reference docs
 ├── crates/agentic-praxis/       # Praxis integration
 ├── python/agentic_api/          # Python distribution, diagnostics, and launcher
 ├── tests/python/                # Python package and CLI tests
@@ -83,6 +85,22 @@ uv venv
 uv pip install -r docs/requirements.txt
 uv run mkdocs serve
 ```
+
+## Releases
+
+- Read [the release guide](docs/developing/releases.md) before preparing or publishing a release or changing release
+  automation. Keep that guide synchronized with the workflow inputs and checks.
+- PRs and merges validate artifacts; they do not publish packages. Release preparation, crates publication, and PyPI
+  publication use separate GitHub Actions workflows. Trigger publishing on `main` after checking the run's commit
+  and version; GitHub Actions handles validation and registry uploads. The crates workflow also publishes the
+  container from the release tag. Container-only recovery uses the dedicated workflow; do not republish packages
+  to repair an image or website failure.
+- Use the Cargo workspace's declared version as the source of truth. Keep the core dependency and lockfile aligned;
+  do not invent a default release version or a separate Python version.
+- Preserve duplicate-version failures and all platform-specific wheel checks. Inspect registry state before retrying
+  any failed publication; never add `skip-existing` or blindly retry a partial upload.
+- Verify actual registry artifacts before reporting a release complete or updating website install versions. PyPI
+  README/metadata fixes require a new release to reach the published package page.
 
 ## Code Style
 

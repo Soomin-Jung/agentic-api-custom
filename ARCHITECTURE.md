@@ -20,6 +20,7 @@ agentic-api/
   crates/
     agentic-server-core/   # "agentic_core" — pure Rust orchestration library
     agentic-server/        # axum HTTP/WS gateway + the `agentic` CLI launcher
+    agentic-llm-d/         # split-execution state backend for the llm-d coordinator
     agentic-praxis/        # placeholder: future Praxis gateway adapter
 ```
 
@@ -30,13 +31,19 @@ agentic-api/
   calls into `agentic_core`, and streams the result back. It also happens to host a
   second, unrelated binary — a CLI launcher (`agentic`) that spawns the gateway and a
   coding harness (Codex/Claude Code) as subprocesses for local use.
+- **`agentic-llm-d`** is a separate axum backend for the llm-d coordinator, which runs
+  inference itself. Its [router](crates/agentic-llm-d/src/lib.rs) exposes
+  `/v1alpha/responses/hydrate` and `/v1alpha/responses/persist`, plus health/readiness
+  probes. It uses `agentic_core` for state services and does not proxy or call a model.
 - **`agentic-praxis`** is currently a placeholder. Per ADR-03, the intent is for it to
   wrap each `agentic-server-core` public function as an `HttpFilter` so Praxis can
   compose the agentic loop declaratively instead of going through `agentic-server`'s
   axum router. Nothing is implemented there yet.
 
-The dependency direction is one-way: `agentic-server` depends on `agentic-server-core`,
-never the reverse. `agentic-server-core` has no knowledge of axum, HTTP, or WebSockets.
+The dependency direction is one-way: `agentic-server` and `agentic-llm-d` depend on
+`agentic-server-core`, never the reverse. `agentic-server-core` has no axum dependency;
+client-facing HTTP/WS transport belongs to the adapter crates, while upstream HTTP/SSE
+I/O lives in core inference transport.
 
 ## Request flow at a glance
 
@@ -61,16 +68,23 @@ Responses API — this project owns the state, vLLM owns tokenization and genera
 (see ADR-01 §1.1).
 
 One Responses turn may contain several inference rounds, but it is exposed and
-persisted as one response:
+persisted as one response. The single-agent path is:
 
 ```
 rehydrate history
       │
       ▼
-build ToolRegistry + discover MCP tools
+create AgentPipeline + prepare tool-search state
+      │
+      ▼
+build EngineOrchestration (ToolRegistry + response budget)
       │
       ▼
 ┌─▶ optional compaction ─▶ one upstream inference round
+│                              │
+│                              ▼
+│                    AgentPipeline ingests JSON or SSE
+│                    and relays public stream events
 │                              │
 │                              ▼
 │                    resolve calls by ownership
@@ -94,7 +108,9 @@ finalize one public response + persist one turn
 A mixed round may contain both ownership classes. Gateway-owned calls still execute
 and are recorded, while the response returns the unresolved client-owned calls for the
 client to resolve. Streaming uses the same round loop and projects it through one
-continuous SSE lifecycle.
+continuous SSE lifecycle. With `multi_agent.enabled: true`, a response-level coordinator
+schedules separate agent contexts through the same inference, tool, and delivery
+boundaries; see [HTTP multi-agent execution](#http-multi-agent-execution).
 
 ## `agentic-server` — the transport layer
 
@@ -102,18 +118,24 @@ continuous SSE lifecycle.
 
 The crate produces a library plus two independent binaries. `src/lib.rs` exports
 `agentic_cli`, `agentic_harness`, `agentic_output`, `agentic_process`, `app`, `auth`,
-and `handler`. On top of that:
+`handler`, and `model_capabilities`. On top of that:
 
 | Binary | Entry point | Uses |
 |---|---|---|
-| `agentic-server` (the gateway) | `src/main.rs` | `app`, `auth`, `handler`, plus binary-private `server.rs` and `config_file.rs` |
-| `agentic` (the CLI launcher) | `src/bin/agentic.rs` | `agentic_cli`, `agentic_harness`, `agentic_output`, `agentic_process` only |
+| `agentic-server` (the gateway) | `src/main.rs` | `app`, `auth`, `handler`, `model_capabilities`, plus binary-private `server.rs` and `config_file.rs` |
+| `agentic` (the CLI launcher) | `src/bin/agentic.rs` | `agentic_cli`, `agentic_harness`, `agentic_output`, `agentic_process`, `model_capabilities` |
 
 These are two unrelated concerns bundled in one crate. If you're working on request
 handling, ignore `agentic_cli*`/`agentic_harness.rs`/`agentic_output.rs`/
 `agentic_process.rs` entirely — they're the launcher that spawns the gateway binary and
 a coding harness (Codex or Claude Code) as subprocesses for local, single-command use
 (`agentic serve <model>`), and never touch the request path.
+
+`model_capabilities.rs` is the one deliberate exception: it is the shared contract both
+sides speak. The gateway resolves each model's `InputModalities` there and serves them in
+the Codex catalog; the launcher parses that same catalog back through
+`CodexCatalogCapabilities` before writing an isolated Codex home. Keeping one definition is
+what stops the HTTP catalog and a launcher catalog from disagreeing about image support.
 
 ### `app.rs`, `server.rs`, `main.rs`
 
@@ -134,8 +156,12 @@ a coding harness (Codex or Claude Code) as subprocesses for local, single-comman
 | Route | Handler | File |
 |---|---|---|
 | `POST /v1/responses` | `responses` | `handler/http/responses.rs` |
+| `GET /v1/responses/{response_id}` | `retrieve_response` | `handler/http/responses.rs` |
 | `POST /v1/responses/compact` | `compact_response` | `handler/http/responses.rs` |
-| `POST /v1/conversations` | `conversations` | `handler/http/conversations.rs` |
+| `POST /v1/conversations` | `create_conversation` | `handler/http/conversations.rs` |
+| `GET/POST/DELETE /v1/conversations/{id}` | Conversation CRUD | `handler/http/conversations.rs` |
+| `POST/GET /v1/conversations/{id}/items` | Batch append and ordered listing | `handler/http/conversation_items.rs` |
+| `GET/DELETE /v1/conversations/{id}/items/{item_id}` | Item retrieval and removal | `handler/http/conversation_items.rs` |
 | `POST /v1/messages` | `messages` | `handler/http/messages.rs` |
 | `POST /v1/messages/count_tokens` | `count_tokens` | `handler/http/messages.rs` |
 | `GET /v1/models` | `models` | `handler/http/models.rs` |
@@ -164,24 +190,91 @@ reads `response.create` messages off the socket and drives the *same*
 `stream_id` values run concurrently, while requests in the same lane remain FIFO;
 requests without a `stream_id` share a default FIFO lane. The session admits at most
 64 active or queued requests and 12 MiB of aggregate request data. WebSocket sessions
-always force `stream: true, store: true`. Because axum's built-in graceful shutdown
+force `stream: true` and honor the requested `store` value. Because axum's built-in graceful shutdown
 doesn't wait for upgraded connections, `AppState` carries a separate
 `WebSocketTracker` so shutdown can drain in-flight sessions.
 
+Multi-agent execution is currently HTTP-only. The shared session rehydration path
+rejects enabled multi-agent configuration both before and after restoring effective
+settings. This covers ordinary WebSocket execution, `generate: false`, and requests
+that inherit configuration from a stored agent tree. The rejection occurs before
+inference or local completion; WebSocket multi-agent support and its lifecycle tests
+remain follow-up work.
+
 Executor streams propagate downstream backpressure through a bounded event channel.
-Upstream SSE lines are capped at 256 KiB, while normalized events are capped at 1 MiB.
-Each request also shares a 1 MiB response budget across MCP discovery, upstream rounds,
-and normalized gateway tool output, so a slow consumer cannot turn a fixed event-count
-buffer into unbounded retained memory. MCP discovery participates in the same 16-permit
+`[responses]` configures separate ceilings for upstream JSON bodies, upstream SSE
+lines, retained response data, and client stream events. Wire ceilings default to
+16 MiB each. Each request shares an 8 MiB retained-data budget across MCP discovery,
+upstream rounds, and normalized gateway tool output. Ingestion charges logical retained
+items rather than repeated SSE envelopes, so changing delta size does not change the
+budget for the same output. These are logical limits, not total process memory bounds. MCP discovery participates in the same 16-permit
 materialization window as gateway calls and is capped at 64 server declarations and
 128 discovered tools per request.
-The WebSocket transport queues only serialized, size-checked events, capped at
-1 MiB each including routing metadata, in its 64-entry outbound queue. Local
-completion validates both lifecycle events before persistence. Authentication is
+The WebSocket transport queues only serialized, size-checked events, capped at the
+configured `max_stream_event_bytes` including routing metadata, in its 64-entry outbound
+queue. `handler/websocket/responses/event.rs` owns that envelope and its limit. The
+executor receives the effective event ceiling after routing overhead and checks its
+terminal event before persistence or session checkpoint publication. Local completion
+validates both lifecycle events before persistence. A slow connection can retain up to
+64 times the configured event ceiling in its outbound queue, in addition to executor
+queues, parsed upstream payloads, and active response state. Authentication is
 rechecked at request dispatch so queued work cannot start after identity expiry.
 Errors are modeled by a dedicated `WsError` enum (`handler/websocket/error.rs`) rather
 than reusing the HTTP JSON-error path, since some failure modes (a dead socket) must
 not attempt to write a response.
+
+### Opt-in core continuation sessions (`executor/session.rs`)
+
+Core callers can use `ExecuteRequest::with_session` or `rehydrate_in_session` to
+retain response state without durable storage. The WebSocket multiplexer owns one
+`ResponseSessionGroup` per connection and keeps one session per lane, including idle
+lanes. No-session HTTP and split execution keep their existing behavior.
+
+The connection retains at most 128 lanes (including the default lane), 32,768 items
+and 16 MiB per checkpoint, and 32 MiB of aggregate serialized checkpoints. These are
+retention ceilings, not measured process-memory bounds. New lanes receive an
+immediate 429 once the lifetime lane limit is reached. Request-count and request-byte
+overloads also return immediate 429 responses without mutating retained state, so
+rejected work cannot invalidate an earlier accepted queued continuation. Other
+validation errors execute in lane order and evict only a matching referenced parent
+when routing is valid. Parent lookup happens when execution begins; accepted queues
+do not reserve parent snapshots. Existing fork and execution-failure eviction rules
+still apply. Disconnect aborts and joins request tasks, waits for active leases to
+release pinned state, and drops the entire connection group before the close handshake.
+
+A `ResponseSession` owns one latest canonical checkpoint and one execution slot.
+The executor pins a parent before inference and publishes completed or incomplete
+state before exposing terminal completion. Failed continuations discard only a
+referenced checkpoint owned by that session. Dropping the owner closes the session
+and rejects late publication. Callers still cancel and join active work explicitly;
+`wait_until_idle` waits for the execution lease to end, but does not cancel it.
+
+`ResponseSessionGroup` allows independent serial members to find and pin each
+other's latest checkpoints. Failed forks cannot evict the source member's state.
+The group bounds lifetime member count, each checkpoint's items and serialized
+bytes, and aggregate retained bytes. Shared parent references count once; replaced
+parents still pinned by active work and prepared checkpoints awaiting persistence
+remain charged until their last reference is released. Reservation happens before
+durable writes, and failure or cancellation returns unused capacity. Replacement
+requires room for both old and new snapshots until publication. These retention
+budgets are not a bound on temporary allocations, execution copies or process
+memory. Scheduling, FIFO queues and active-work limits remain caller concerns.
+
+Response-scoped session history records reasoning, messages and calls in inference-round order,
+then built-in call outputs. Public output is accumulated separately and is not
+appended to retained history twice. Compaction replaces the canonical window while
+preserving MCP discovery records needed for orchestration. Durable restoration
+and replayed compaction input select the effective compacted window before validating current calls;
+obsolete stored rows are not deleted or charged to that retained window.
+
+For response-scoped session execution, `store: false` has no durable writes or
+database fallback. A stored child of a transient parent persists the complete
+canonical window without creating a row or dangling database reference for that
+parent. Explicit `conversation_id` requests keep the existing durable Conversations
+policy and append output only through the conversation handler. Their session lease
+still serializes execution without recording a second copy. Core commit supports
+prewarming without inference; WebSocket `generate: false` uses that same session
+rehydration and commit path.
 
 ### `handler/common.rs`
 
@@ -232,6 +325,40 @@ optional, or defaulting helper expresses the required policy; add a focused help
 there when the policy is reused. Direct `serde_json` use is fine in tests, fixtures,
 and cassette tooling. Keep Serde wire-format attributes on the owning type.
 
+### Prefer established Rust patterns
+
+Before adding a conversion helper, wrapper API, or state abstraction, search the
+owning types and the standard Rust traits for an existing pattern. Use the
+[standard conversion traits](https://doc.rust-lang.org/std/convert/) and consult the
+[Rust Cookbook](https://rust-lang-nursery.github.io/rust-cookbook/) for established
+recipes for common operations. Prefer code whose ownership, failure mode, and
+lifecycle are visible in its types.
+
+- Implement `From<T> for U` for an infallible, obvious, and value-preserving consuming
+  conversion. This provides `Into<U>` automatically; implement `From` rather than
+  implementing `Into` directly.
+- Implement `TryFrom<T> for U` when validation or conversion can fail. This provides
+  `TryInto<U>` automatically and keeps the error type with the destination contract.
+- Use `AsRef`, borrowed accessors, or typed views for cheap borrowed conversions that
+  should not consume or clone the value.
+- Use iterator adapters such as `map`, `filter_map`, `flat_map`, and `collect` for
+  collection conversion. Keep the per-item conversion on the item type instead of
+  duplicating a variant match in each caller.
+- Use newtypes to establish validated identities, indexes, names, and framed values at
+  construction. `OutputIndex`, `NonEmptyToolName`, and `SseLine` are examples in this
+  codebase.
+- Use enums and exhaustive matches for closed state machines, `Option`/`Result`
+  combinators for explicit absence and failure, and RAII guards for cleanup or
+  cancellation tied to ownership.
+
+Search `types/io/` before introducing a helper named `convert_*`, `into_*`, or
+`append_*`. Existing examples include `TryFrom<&EventPayload>` for typed output items,
+`From` implementations between wire/domain types, and
+`OutputItem::to_input_item` for the deliberately optional continuation conversion.
+An inherent conversion method is appropriate when the operation has domain policy
+that the standard trait cannot express clearly, as with output variants that are
+intentionally omitted from continuation input.
+
 ### `types/` — wire shapes, not behavior
 
 This module's job is JSON ⇄ Rust type conversion and shape validation for the
@@ -243,10 +370,12 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   is the seam between the OpenAI-shaped request and vLLM's contract. It: flattens Codex
   namespace tool members to model-visible names, validates every declared tool
   (`ResponsesTool::validate()`), and normalizes each supported model-visible tool to
-  `UpstreamTool::Function` (`ResponsesTool::to_function_tools()`). File search, code
-  interpreter, and unknown typed declarations currently normalize to no upstream
-  tool; every declaration that does reach vLLM is `type: "function"`, because that's
-  the only tool type it speaks. The conversion also resolves/validates `tool_choice`
+  `UpstreamTool::Function` (`ResponsesTool::to_function_tools()`). File search and
+  unknown typed declarations normalize to no upstream tool; a code interpreter
+  declaration normalizes to a fixed function contract. The server request path
+  checks runtime availability before it calls this conversion. Every
+  declaration that does reach vLLM is `type: "function"`, because that's the only
+  tool type it speaks. The conversion also resolves/validates `tool_choice`
   and applies `ResponsesInput::model_input()`. It's called from
   `executor/upstream.rs`'s `fetch_blocking_payload` and `fetch_stream_payload` — the
   two functions that actually build the outbound request to vLLM.
@@ -256,12 +385,17 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   (the normalized `FunctionTool` and `ToolChoice`, distinct from tool *declarations*),
   `usage.rs` (token accounting structs). `ResponsesInput::model_input()` is the final
   model-visibility boundary used by `RequestPayload::to_upstream_request`: it removes
-  orchestration-only `McpListTools` and `CompactionTrigger` input items. A persisted
+  orchestration-only `McpListTools`, `CompactionTrigger`, and public collaboration input items. A persisted
   `Compaction` item is different: the latest checkpoint supersedes earlier model
   context and is converted into an assistant `output_text` summary, while canonical
   retained user messages and items after the checkpoint remain. This keeps rich
   continuation state available to orchestration without sending unsupported public
   item types to vLLM.
+- **`types/io/multi_agent.rs`** — public collaboration output items and agent-message
+  content. Its `input` module defines replay forms with optional IDs; output IDs remain
+  required. Agent-message content includes text, images, files, refusals and encrypted
+  parts, preserving response content during replay. These wire types do not impose a
+  storage policy; stored-only execution is a gateway admission constraint.
 - **`types/tools/params.rs`** — the tool **declaration** shapes a client sends:
   `ResponsesTool` (tagged enum: `Function`, `ToolSearch`, `Mcp`, `WebSearch`, `FileSearch`,
   `CodeInterpreter`, `Namespace`, `Custom`, `Unknown`) and each variant's param struct.
@@ -278,6 +412,46 @@ access happen — those live in `tool/`, `executor/`, and `storage/` respectivel
   `RequestPayload`/`ResponsePayload`.
 - **`types/event.rs`** — small status enums (`ResponseStatus`, `MessageStatus`).
 
+#### Output-to-input conversion for continuation rounds
+
+`types/io/output.rs::OutputItem::to_input_item` is the single semantic conversion
+from a response output item to the input item seen by a later inference round. Code
+that continues a response must use this method; it must not serialize an `OutputItem`
+as input or introduce another match over `OutputItem` variants.
+
+```text
+current round Vec<OutputItem>
+        │
+        ▼
+filter_map(OutputItem::to_input_item)   ← the conversion policy
+        │
+        ▼
+ResponsesInput                         ← append only
+        │
+        ▼
+ResponsesInput::model_input()          ← final upstream-visibility filter
+```
+
+There are two adapters around that one policy:
+
+- `executor/gateway.rs::append_output_items_to_input` calls
+  `OutputItem::to_input_item` and appends the result to the current request before the
+  next round. Its handling of `ResponsesInput::Text` versus `ResponsesInput::Items` is
+  container mutation, not a second conversion policy.
+- `storage/types/item.rs::InOutItem::into_input_items` uses the same method when
+  rebuilding continuation input from persisted history. Already stored `InputItem`s
+  pass through unchanged.
+
+Messages, reasoning, function calls, custom calls, tool-search calls, compaction
+items, and MCP list metadata have explicit continuation representations. Public
+`web_search_call` and `mcp_call` output items return `None`: gateway execution records
+the canonical model-facing function call and its `function_call_output` separately,
+so converting the public projection would duplicate the call or lose result details.
+Gateway tool results are already `InputItem`s and are appended through
+`append_tool_outputs`; they do not need an output-to-input conversion.
+
+Native upstream `code_interpreter_call` output items convert to typed continuation input. A gateway-executed code-interpreter call is marked internally and omitted by the same conversion because its model-facing function call and output are retained separately; storage preserves that origin outside the public wire shape.
+
 ### `events/` — parsing upstream SSE, and how to add a new event type
 
 This module normalizes raw upstream SSE lines into typed frames, decoupled from the
@@ -289,21 +463,26 @@ executor so the accumulator doesn't do inline JSON parsing.
   yet), `WireEvent` (the raw pass-through shape, used for re-serialization),
   `EventFrame { event_type, payload, wire }` (the normalized output), `SSEItemType`
   (output-item kind: reasoning, function call, MCP call, etc.).
-- **`normalize.rs`** — `normalize_sse_line(&str) -> Option<EventFrame>` parses a
-  `data: ...` line and classifies it; `extract_payload` dispatches to small per-event
-  `extract_*` helpers.
+- **`sse.rs`** — `SseLine` and `ClassifiedSseLine`. `SseLine::parse` performs only
+  field-level SSE classification (`Data`, `Done`, or `Ignore`) and accepts the optional
+  space after `data:`. Its redacted `Debug` implementation reports only payload size.
+- **`normalize.rs`** — `normalize_sse_data_checked` parses one classified data payload
+  into an `EventFrame` while preserving invalid-output-index errors for the ingestion
+  policy. `extract_payload` dispatches to small per-event `extract_*` helpers. The
+  public `normalize_sse_line` remains a convenience adapter for callers that do not
+  need policy-aware errors.
 
 **To add support for a new SSE event**, the touch points are, in order:
 1. `events/types.rs` — add the `SSEEventType` variant, its wire-string mapping both
    directions, and (if it carries structured data) an `EventPayload` variant.
 2. `events/normalize.rs` — extend `extract_payload` and add an `extract_*` helper if
    the payload needs real parsing (otherwise it can fall through to `Raw`).
-3. Extend the single ingestion transition dispatcher. Today that is
-   `executor/accumulator.rs`'s `process_event`; [#243](https://github.com/vllm-project/agentic-api/issues/243) will
-   consolidate the stable entry point. Do not create a caller-specific validator or folding path.
-4. If the event is gateway-synthesized (a built-in tool's lifecycle event), construct a typed `EventFrame` in
-   `executor/gateway.rs` and feed it through the same ingestion/relay boundaries. Function-call shape translation
-   remains an ingestion concern, currently implemented by `executor/function_sse.rs`.
+3. Extend `executor/accumulator/`'s typed transition matches. Streaming callers enter
+   through `RoundIngestion::push`; do not create a caller-specific validator or folding
+   path.
+4. If the event represents a client-executed function shape, extend the corresponding
+   translator under `executor/translate/`. If it is gateway-synthesized, construct the
+   typed `EventFrame` in `executor/gateway.rs`; `pipeline/delivery.rs` owns client relay.
 
 ### `executor/` — the loop, and the server's only door into storage
 
@@ -330,27 +509,52 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   client-executed call produces the existing missing-output error. Gateway-executed
   built-in tool calls are resolved and recorded within their originating round, so
   they do not remain pending at this boundary.
-- **`upstream.rs`** — `fetch_blocking_payload`/`fetch_stream_payload`: builds the
-  `UpstreamRequest` (via `to_upstream_request`, see above) and drives one round of
-  upstream inference, running the accumulator and `FunctionSseTranslator` over the
-  response and feeding synthesized frames through `GatewayStreamAccumulator`.
+- **`upstream.rs`** — the narrow adapter between inference transport and the pipeline.
+  It builds `UpstreamRequest`s, snapshots registry classification facts into an owned
+  `TranslationContext`, passes the shared retained-data budget into ingestion, and
+  passes each live JSON or SSE body to `AgentPipeline`. It does not charge SSE wire bytes.
 - **`inference.rs`** — `call_inference()`: the raw HTTP/SSE transport to vLLM. No
   parsing beyond splitting `data: ...` lines and stopping at `[DONE]`.
+- **`pipeline.rs`, `pipeline/`** — `AgentPipeline`, the request-owned entry point for
+  both response body formats. `RoundIngestion` owns the synchronous per-round semantic
+  core; `StreamDelivery` owns awaited, ordered client delivery across rounds.
 - **`engine.rs`** — the top-level orchestrator: `ExecuteRequest`/`execute()`,
-  `create_conversation()`, and — this is worth being precise about —
-  **`run_gateway_tool_loop` is where the multi-round tool loop actually lives**, not in
-  `gateway.rs`. It calls `upstream.rs` for each round, hands the resulting output to
-  `gateway.rs`'s helpers, and applies its local `classify_round`/`LoopDecision` to
-  decide whether to loop again, finish, hand back to the client, or return an
-  incomplete response (capped at `MAX_GATEWAY_TOOL_ROUNDS = 10`). It accumulates
-  output and token usage across inference rounds, changes continuation `tool_choice`
-  to `auto`, and persists gateway function calls plus their outputs as model-facing
-  `InputItem`s. Also home to `run_compaction_trigger`,
+  `create_conversation()`, and `EngineOrchestration`, which owns the response byte
+  budget, accumulated output/usage, and root `AgentTurn`. It advances the turn and
+  applies response completion policy to its typed `RoundResult`/`RoundDecision`.
+  The current single-agent path supplies `MAX_GATEWAY_TOOL_ROUNDS = 10` as a per-turn
+  limit, not a future tree-wide collaboration limit. Also home to `run_compaction_trigger`,
   `run_blocking`, and `run_stream` (spawns the loop, forwards events as SSE, persists
-  before yielding the terminal event).
-- **`persist.rs`** — `persist_response`/`persist_turn`, which route to
-  `ConversationHandler` or `ResponseHandler` in `modes/` depending on whether the turn
-  is conversation-scoped or response-scoped.
+  before yielding the terminal event). `engine/streaming.rs` owns the streaming task's
+  cancellation, failure delivery, and terminal validation before persistence.
+- **`engine/agent_turn.rs`** — execution for one agent: `AgentTurn` owns the tool
+  registry and round counter and exclusively borrows its `AgentPipeline`. The response
+  adapter retains the pipeline so error handling can recover its context and delivery
+  state. `run_round` performs compaction, inference and built-in tool execution using
+  the engine's shared budget, records canonical call/output history, and reports a
+  typed outcome. It does not spawn agents or finalize/persist a public response.
+- **`multi_agent.rs`** — scoped task ownership for engine-owned tree coordination.
+  `RunOwner` bounds root/descendant tasks, supports interruption, and joins teardown.
+  `multi_agent/registry.rs` holds parentage, current turn identity, logical phases and
+  bounded canonical mailboxes. It reserves bytes through the shared response budget
+  before mutation and settles turns with exactly one parent notification. Registry
+  operations are synchronous; the coordinator must reconcile/join work before settlement.
+  `multi_agent/pending_calls.rs` retains each client call's originating agent, turn and
+  kind. It validates output batches before mutation, retains accepted outputs until
+  transfer to canonical context, and keeps resolved IDs for duplicate detection.
+  Acceptance does not resume an agent or decide visibility for superseded turns.
+  This table complements the existing single-history rehydration validator; neither
+  public error mapping nor transport-specific batch policy is defined by it.
+  `engine/multi_agent.rs` coordinates these components for stored HTTP responses.
+  Canonical histories and pending calls remain owned by the coordinator; the pipeline never
+  spawns subagents. Its `context`, `actions`, `rounds`, `delivery`, and `compaction`
+  modules separate restoration, collaboration commands, scheduling, public output and
+  explicit root compaction. The run owner cancels and joins tasks during teardown.
+  Interruption takes effect at the current round boundary. The contracts are described below.
+- **`persist.rs`** — `persist_response`/`persist_turn`, which apply the request's
+  storage policy (`should_persist`: a no-session `store: false` turn is not written) and
+  route to `ConversationHandler` or `ResponseHandler` in `modes/` depending on whether the
+  turn is conversation-scoped or response-scoped.
 - **`compaction.rs`** — `compact_response()` (the explicit `/v1/responses/compact`
   path) and `maybe_compact_context()` (automatic, threshold-triggered, called from the
   round loop before each inference call).
@@ -360,170 +564,376 @@ call inference, run the tool loop, persist. `agentic-server` never reaches past 
   `StorageError` into `ExecutorError`. **This is the sanctioned boundary between the
   executor and the storage stores** — nothing above this layer touches
   `storage::conversation`/`storage::response` directly. Today they only cover what the
-  pipeline needs (`get`, `get_or_create`, `create`, `rehydrate[_snapshot]`,
-  `execute_turn`, `validate_exists`); **any new CRUD operation beyond persist/rehydrate
-  belongs here**, added as a new method that delegates to the corresponding store.
+  pipeline and retrieval need (`get`, `get_or_create`, `create`, `rehydrate[_snapshot]`,
+  `execute_turn`, `commit_tree`, `retrieve`, `validate_exists`); **any new CRUD operation
+  beyond persist/rehydrate belongs here**, added as a new method that delegates to the corresponding store.
 - **`error.rs`** — `ExecutorError`, with the mapping methods (`http_status()`,
   `error_type()`, `into_response_body()`, ...) handlers use to render errors.
 
-#### Target streaming pipeline and ownership boundaries
+#### HTTP multi-agent execution
 
-The streaming executor is converging on one linear pipeline under RFC
-[#241](https://github.com/vllm-project/agentic-api/issues/241). The current implementation still has overlapping
-validation, accumulation, translation, and emission responsibilities in `upstream.rs`, `accumulator.rs`,
-`function_sse.rs`, and `gateway_accumulator.rs`; that overlap is migration state, not an extension pattern. New work
-must move toward the following ownership model:
+`multi_agent.enabled` selects gateway orchestration; it is not forwarded to the
+upstream model. Enabled requests require `store: true`; the current validator also
+rejects `max_tool_calls`, `reasoning.summary`, and `reasoning.generate_summary`. These are gateway
+validation rules, not a claim that every upstream provider has the same restrictions.
+New requests without multi-agent configuration use single-agent execution;
+continuations of a stored agent tree inherit its configuration.
 
 ```text
-upstream HTTP bytes
-        │
-        ▼
-inference transport ──raw SSE data line──▶ event normalization
-                                                │ EventFrame
-                                                ▼
-                                  synchronous ingestion state machine
-                                                │ validated semantic events/items
-                                                ▼
-                                           stream relay ──▶ client
-
-engine.rs surrounds the per-round path: inference rounds → tool loop → persistence
+EngineOrchestration — one public response and persistence boundary
+└─ MultiAgentRun — tree, admission, mailboxes, canonical histories, completion policy
+   ├─ RunOwner — scoped round/compaction tasks, cancellation and joining
+   └─ Per-agent execution
+      ├─ AgentPipeline — context, tool-search state and round ingestion
+      └─ AgentTurn / AgentExecutionState — registry, round progress and run_round
 ```
 
-| Stage | Owns | Must not own |
-| --- | --- | --- |
-| Inference transport (`inference.rs`) | HTTP request/response I/O, byte-chunk handling, SSE framing, timeouts, and `[DONE]` detection | Typed semantic-event validation, output-item lifecycle, translation, or client ordering |
-| Event normalization (`events/`) | Converting one raw SSE data line into one typed `EventFrame` | Cross-event lifecycle state, response assembly, or delivery |
-| Synchronous ingestion ([#243](https://github.com/vllm-project/agentic-api/issues/243)) | One entry point for normalization policy, semantic-event lifecycle validation, typed output-item slots, delta folding, tool-call shape translation, and finalization | Async task placement, client backpressure, cross-round sequencing, or persistence |
-| Stream relay ([#244](https://github.com/vllm-project/agentic-api/issues/244)) | Cross-round sequence numbers, public `output_index` rebasing, lifecycle suppression, deferred-event ordering, bounded client delivery, and disconnect propagation | Re-parsing SSE data, reconstructing output items, or deciding the tool loop |
-| Orchestrator (`engine.rs`) | Turn and inference-round control, tool-loop decisions, terminal-response policy, and persistence | SSE framing/parsing or a second semantic-event state machine |
+Parallel tool execution runs multiple calls within one agent's inference round.
+Multi-agent execution gives each agent its own history, assignment, tool registry,
+loaded tool definitions and round progress. The model requests collaboration through
+canonical function tools; `actions.rs` handles spawning, messages, follow-up tasks,
+waiting, interruption and listing. `max_concurrent_subagents` limits active descendant
+turns across the whole tree, excluding the root; it does not fix the total number of
+agents or collaboration calls in a response. Finished turns release capacity.
+`guidance.rs` adds current identity, assignment, direct-child states and available
+slots to each model round without storing that guidance in canonical history.
 
-The boundary contract is **one owner and one path per concern**:
+The coordinator alone mutates canonical agent state. Workers receive snapshots and
+return typed outcomes. `AgentRegistry` records logical phases and mailbox contents;
+waiting agents resume on mail or a wait deadline, without holding an inference task
+open. Child completion notifies its parent once. A root final answer settles only the
+root's turn: descendants continue until they finish or pause for client tool outputs.
+Mail to an idle root is retained without restarting it. Root completion does not
+implicitly interrupt descendants; interruption remains an explicit collaboration action.
+The run shares a retained-data budget and accumulates inference/compaction usage, while separate retention, round
+and runtime limits bound work. Teardown cancels and joins scoped tasks before the
+terminal response decision is exposed.
 
-- Every streamed upstream response enters the same synchronous ingestion state machine. Rejecting and compatibility
-  validation policies may choose different outcomes, but they must exercise the same typed transitions rather than
-  maintaining separate validators.
-- An output item's lifecycle is scoped to one inference round and keyed by validated `output_index`; item ID and kind
-  must agree on every subsequent semantic event. Completed slots remain distinguishable from never-seen slots so
-  index reuse and duplicate completion can be detected. Finalization consumes the round's ingest state.
-- Each supported output-item kind has typed in-flight state and participates in exhaustive transition/finalization
-  matches. Adding a kind extends those declared matches and their tests instead of adding a side path.
-- Downstream stages consume the typed result of the preceding stage. They do not parse the raw line again, infer a
-  second lifecycle from the wire object, or reconstruct response state already owned upstream in the pipeline.
+**Client tool continuations.** Function, local shell, custom and tool-search calls
+can suspend an agent for client execution. `PendingClientCalls` records each call ID,
+item kind and owning agent turn outside the replaceable history prefix. A continuation
+must supply outputs for every outstanding call; the batch is validated before any
+agent history changes. Each accepted output goes only to its owner and resumes that
+agent. A parent parked waiting for children stays asleep until mailbox delivery wakes
+it; a new user message resumes the root.
 
-Concurrency is a deployment choice around this synchronous semantic core, not part of the core itself. Introduce a
-channel only at a real task-ownership boundary. Every channel needs a bounded entry count and either a byte budget or
-a maximum item size that gives a known memory ceiling. Define what happens when it is full, when the receiver
-disconnects, and when either task is cancelled or fails; carry cancellation through the whole producer/consumer path
-and join spawned tasks. Instrument entry and byte occupancy when tuning a capacity.
+Tool-search outputs restore discovered definitions into the requesting agent's
+`ToolSearchState` before its next registry and upstream request are built. Namespace
+and custom declarations still use the existing canonical function normalization and
+public-shape translators. MCP, web search and operator-enabled code interpreter execute in the gateway and append their
+canonical call/output pairs during the round, so they require no client output
+continuation. Tool search retains its normal `parallel_tool_calls` validation; enabling
+multi-agent execution does not bypass that rule.
 
-Run ingestion inline unless representative measurements show that worker placement improves the complete request
-path. Benchmark [#245](https://github.com/vllm-project/agentic-api/issues/245) owns that decision and must compare
-equivalent semantics, realistic event sizes and pacing, concurrent requests, slow consumers, tail latency, CPU,
-memory, thread count, and queue occupancy. `spawn_blocking` and a capacity such as 16 entries are hypotheses, not
-architectural defaults.
+Code interpreter uses the same canonical function/tool loop in every agent. Agents
+share the ready executor and its process-wide guest permits through `ExecutionContext`;
+`max_concurrent_subagents` does not increase interpreter capacity. Its public
+`code_interpreter_call` items and streaming events are attributed to the executing
+agent and use the response-wide output indexes. Canonical call/output pairs survive
+stored tree continuation, so submitting a sibling's client tool output does not
+execute completed Python calls again. Feature, operator and readiness gates apply
+before inference, including when the tool declaration is inherited from storage.
 
-#### `accumulator.rs` — `ResponseAccumulator`: a stability contract, not just a file
+**Compaction.** Automatic compaction is per agent. `prepare_agent` supplies a default
+compaction threshold of 100,000 estimated tokens when none is configured. A
+`CompactionPlan` owns a resolved-prefix snapshot, agent identity and context generation.
+Its completion replaces that prefix only when the generation still matches
+(`CompactionCommit::Applied`); a stale result leaves current history intact. The
+coordinator accounts for completed compaction work once even when the result is stale.
+Pending calls, unresolved suffixes and new mail are not discarded by prefix replacement.
 
-`ResponseAccumulator` is the SSE state machine that turns a stream of `EventFrame`s
-into a `ResponsePayload`. Its public surface is intentionally small
-(`new`, `from_json`, `from_stream`, `from_sse_lines`, `mark_incomplete`, `finalize`) and
-**should not grow outside the approved [#243 consolidation](https://github.com/vllm-project/agentic-api/issues/243)**.
-Until that consolidation lands, don't add a new public method and call it from another method on the struct — that's
-another surface API change. Extend current behavior through the existing pattern while preserving the target
-single-ingestion boundary above:
+An explicit `compaction_trigger` in a Responses request uses
+`MultiAgentRun::compact_root`: it restores the tree, applies supplied continuation
+input and compacts the root's resolved prefix while preserving child histories and
+pending calls. No agent tasks run during this operation. The resulting tree passes
+through the same validation and persistence boundary as a normal multi-agent response.
+This is distinct from the standalone `/v1/responses/compact` endpoint.
 
-- Each output item arrives via `response.output_item.added` and is **parked** as an
-  `InFlightEntry` in `self.in_flight: IndexMap<String, InFlightEntry>`, keyed by item
-  ID, in insertion order.
-- Items are **constructed** via real `TryFrom<&EventPayload>` impls
-  (`ReasoningOutput::try_from`, `FunctionToolCall::try_from`, `CustomToolCall::try_from`,
-  `OutputMessage::try_from`, `CompactionItem::try_from`, `McpCall::try_from`,
-  `McpListTools::try_from`, all in `types/io/output.rs`) — not ad hoc field-by-field
-  building in the accumulator.
-- Streamed deltas mutate the parked entry's buffer in place.
-- Items are **completed** via the `ApplyDone` trait
-  (`fn apply_done(&mut self, payload: &EventPayload, buffer: &mut String)`), applied on
-  the matching `*_done` event or on `response.output_item.done`.
-- Parked entries are promoted into the final `output: Vec<OutputItem>` only once, in
-  `finalize_all`, which drains `in_flight`, calls each item's `finalize()`, sorts by
-  `output_index`, and appends to the output — invoked at end-of-stream or on a terminal
-  `response.completed|failed|incomplete` event.
+**Persistence and public output.** A versioned `StoredTreeSnapshot` contains agent
+histories, phases, mailboxes, loaded tools and pending client calls.
+`ValidatedTreeCheckpoint` checks its limits, identities and references before live
+state is constructed or committed. `persist.rs` calls the existing mode handler's
+`commit_tree`; transport handlers do not write storage directly, and tree persistence
+uses the existing response/conversation stores.
+`ResponseMetadata.multi_agent_tree` restores execution state, while
+`response_snapshot` retains the exact terminal public response for GET retrieval.
+Continuation restoration discards the latter duplicate but retains the tree.
 
-If you're adding a new output-item kind: give it a `TryFrom<&EventPayload>` impl and an
-`ApplyDone` impl in `types/io/output.rs`, and add it to the `InFlight` enum and the
-`start_output_item`/`finalize` match arms in `accumulator.rs`. Don't restructure the
-public methods to accommodate it.
+The public transcript contains attributed `multi_agent_call` (`mac_`),
+`multi_agent_call_output` (`maco_`) and `agent_message` (`amsg_`) items alongside each
+agent's reasoning, messages and tool calls. Public collaboration items are not replayed
+as model input; the coordinator retains canonical function calls, outputs and delivered
+mail in private agent histories. `ResponsesInput::model_input` removes the public
+collaboration items at the upstream boundary.
 
-#### `gateway_accumulator.rs` — `GatewayStreamAccumulator`
+Both JSON and SSE use this coordinator. Streaming workers feed a bounded,
+acknowledged channel into the existing response-wide `StreamDelivery`.
+`AgentRoundId` scopes source indexes; delivery's public-position mapping is shared
+with final output assembly. The coordinator emits one response lifecycle and completes
+items after canonical registration and public projection. Delivery does not become a
+second response assembler.
 
-This is a smaller, different job than the name's similarity to `ResponseAccumulator`
-suggests: it holds no `OutputItem`/in-flight item state at all. Its purpose is to make
-several upstream rounds of gateway tool execution look like **one continuous SSE
-stream** to the client — it assigns monotonically increasing `sequence_number`s across
-rounds, rebases `output_index` so gateway-tool output lands after prior output, and
-deduplicates `response.created`/`response.in_progress` so they fire once per response
-rather than once per round. `gateway.rs` and `upstream.rs` both feed frames through it
-via `process_event`/`synthetic_event`/`emit_sse_frame`.
+**Recorded contract checks.** `tests/multi_agent_contract_test.rs` loads independently
+recorded OpenAI and gateway YAML for review, proposals, mixed tools and client-executed
+tools in both streaming and non-streaming modes. The typed comparison helper checks
+call/agent relationships, lifecycle consistency and required tool kinds; the client
+scenario also checks tool-search, discovered functions and custom tool continuations.
+It permits model-dependent names, text, identifiers and action counts rather than
+requiring byte-for-byte output equality. Unit tests use synthetic values; cassette
+capture remains in the Python recorder and scenario shell script.
 
-This is the current precursor to the stream-relay boundary in
-[#244](https://github.com/vllm-project/agentic-api/issues/244). New delivery,
-buffering, and backpressure behavior belongs in that relay consolidation rather than
-in the response accumulator or inference transport.
+#### Responses pipeline and ownership boundaries
 
-#### `function_sse.rs` — `FunctionSseTranslator`
+RFC [#241](https://github.com/vllm-project/agentic-api/issues/241) and issue
+[#243](https://github.com/vllm-project/agentic-api/issues/243) established one path for
+JSON and live SSE response bodies:
 
-Upstreams without native support for a declared tool type emit `function_call` SSE
-events instead. This translator borrows the request-scoped tool registry for
-classification and reshapes those raw calls accordingly:
-- **Custom tools** — rewritten into the public `custom_tool_call` event shape
-  (`output_item.added` / `custom_tool_call_input.delta` / `.done` / `output_item.done`),
-  reconstructing the `input` JSON incrementally from the streamed `arguments`.
-- **Gateway-owned tools** (`Mcp`, `WebSearch`, `FileSearch`, `CodeInterpreter`) — raw
-  frames are suppressed entirely. Their real client-visible events are synthesized
-  later, once the call has actually executed, by `gateway.rs`.
-- **Client-owned tools** (`Function`, `CodexNamespace`) — pass through unchanged.
-- **Tool search** — native `tool_search_call` events pass through as typed items;
-  synthetic `function_call` events named `tool_search` are projected into that same
-  public lifecycle after validation.
+```text
+inference.rs
+  ├─complete JSON───────────────────────┐
+  └─framed SSE lines─▶ SseLine::parse───┤
+                                        ▼
+                                  AgentPipeline
+                         │
+                         ▼
+                   RoundIngestion
+                         │
+                         ▼
+              ResponseAccumulator
+              (typed response state)
+                         │ validated frame + typed call
+                         ▼
+              TranslationDispatcher
+                (per-tool translators)
+                         │ translated SSE frames
+                         ▼
+                  StreamDelivery
+                         │
+                         ▼
+              GatewayStreamAccumulator
+                         │
+                         ▼
+                       client
 
-It also buffers function-call events that arrive before the call's name is known
-(bounded at 256 KiB) and replays them once the name resolves.
+EngineOrchestration surrounds the pipeline:
+inference rounds → gateway execution → terminal policy → persistence
+```
+
+| Stage | Responsibility |
+| --- | --- |
+| Inference transport (`inference.rs`) | HTTP I/O, byte chunks, SSE framing, timeouts, and `[DONE]` detection. |
+| Event parsing (`events/`) | Classify one SSE line and normalize one data payload into an `EventFrame`. |
+| Request pipeline (`pipeline.rs`) | Hold one request context, tool-search state, cross-round delivery state, and the JSON/SSE body entry points. |
+| Round ingestion (`pipeline/ingest.rs`) | Process one body with one `ResponseAccumulator`, one `TranslationDispatcher`, and final response normalization. |
+| Stream delivery (`pipeline/delivery.rs`) | Provide awaited sender delivery, gateway-event deferral and release, response IDs, and cross-round stream accumulation. |
+| Agent execution (`engine/agent_turn.rs`) | Own the per-agent registry and round progress; perform inference/tool work and return typed round outcomes. |
+| Orchestration (`engine.rs`) | Own agent execution, the shared response budget, response assembly, terminal policy, and persistence coordination. |
+
+`AgentPipeline` currently lives for the complete public response. `EngineOrchestration`
+creates the shared response budget and an `AgentTurn` that retains its own registry
+and exclusively borrows the pipeline. Each turn step asks `upstream.rs` to run the
+inference body through `run_with_json_body` or live `run_with_stream_body`. A new
+`RoundIngestion` is created for every body and consumed by finalization, while
+`StreamDelivery` and `GatewayStreamAccumulator` survive across inference rounds.
+
+For multi-agent execution, the engine owns tree coordination and schedules separate
+agent execution contexts. Per-agent ingestion feeds typed frames through a bounded,
+acknowledged channel into one response-wide `StreamDelivery`. Its source-scoped index
+mapping is shared with the engine's final response assembly; delivery does not assemble items.
+
+The live runner polls one framed line, performs synchronous ingestion and translation,
+then awaits delivery before polling the next line. This propagates bounded sender
+backpressure to the upstream body. Ingestion remains inline; moving it to a worker is
+the benchmark decision tracked by
+[#245](https://github.com/vllm-project/agentic-api/issues/245).
+
+The boundary contract is one owner and one path per concern:
+
+- Strict and lenient validation use the same typed accumulator transitions; the policy
+  selects validation/disposition rules and end-of-stream behavior.
+- Output-item lifecycle state is scoped to one inference round and keyed by validated
+  `output_index`. Item ID and kind must match on later events; active and completed
+  slots remain distinct so index reuse and duplicate completion are rejected.
+- Translation consumes validated `EventFrame`s plus the accumulator's typed function
+  call view and produces the public wire lifecycle for client-owned tools.
+- Delivery consumes translated frames and provides ordered, awaited client emission
+  across inference rounds.
+
+#### `accumulator/` — typed response assembly
+
+`ResponseAccumulator` owns validation, response lifecycle, typed output slots, delta
+folding, terminal error/incomplete state, usage, and final `ResponsePayload` assembly.
+`slot.rs` owns active/completed lifecycle and identity bindings, `identity.rs` extracts
+semantic identities, and `json.rs` contains strict JSON response-shape validation.
+`active.rs` dispatches exhaustively to per-kind state; `active_text.rs` owns message
+parts and reasoning text/summary accounting. Both JSON and SSE ultimately use the same finalization
+state.
+
+Shared `response.content_part.*` events identify an item by output index and item ID,
+not by content type. Normalization parses a typed completed part; the existing slot
+resolves whether it belongs to a message or an agent message. Each owner's state
+validates the allowed content, duplicate completion and consistency with the final item.
+
+Output items are constructed through their `TryFrom<&EventPayload>` implementations in
+`types/io/output.rs`. Active slots fold deltas in place and use the type's `ApplyDone`
+implementation when its completion event arrives. For an already parsed output-item
+completion, the private `MergeDone` implementations in `accumulator/completion.rs`
+merge the concrete item with its retained fields and buffers. `slot.rs` dispatches
+to those implementations after validating identity and lifecycle. Finalization
+promotes each completed typed item once and preserves validated output-index order.
+
+The pipeline's streaming entry is `process_line(ClassifiedSseLine)`. It normalizes and
+validates a data line, applies the event to the slot keyed by its validated output
+index, and returns at most one validated `EventFrame` for translation. For function
+events, `accumulated_function_call(output_index)` exposes a borrowed typed call and its
+folded arguments. `finish` applies SSE end-of-stream policy; `finalize` preserves the
+status loaded from a complete JSON body.
+
+When adding an output-item kind, extend its typed construction and completion logic in
+`types/io/output.rs`, the variants and exhaustive dispatch in `accumulator/active.rs`,
+and completed-item measurement in `executor/response_budget.rs`.
+
+Retained-byte accounting stays in synchronous ingestion. `response_budget.rs` defines
+one comprehensive `RetainedSize` measurement and `RetainedAccount` for charging growth
+and reconciling completed items. Every unbounded collection entry has a structural
+charge, including empty JSON values and web-search queries; unrestricted string fields
+such as `role`, content `type`, and reasoning `status` count by length. Bounded enums
+need no variable charge. Delta text and new part containers are charged before growth.
+Completion uses the existing `ApplyDone`/`MergeDone` policy and measures its effect;
+reasoning text/summary completion measures only the inserted part and its corresponding
+streamed counter; shell command completion measures only its command and current buffer.
+Both avoid rescanning preceding parts or static nested metadata. Full measurement is reserved
+for item completion and final reconciliation. `slot.rs` charges supplied identities before
+index insertion or late binding; IDs shared by a typed item and its indexes count once
+logically, including pending kinds with no typed snapshot yet. `accumulator/details.rs`
+charges retained terminal errors and incomplete reasons under the same JSON/SSE measurement.
+Charges are cumulative without refunds.
+A rejected completion may temporarily allocate its single bounded wire payload before
+ingestion drops the failed round.
+
+#### `translate/` — tool-specific public-shape translation
+
+`TranslationDispatcher` is a synchronous inline dispatcher. It owns per-call
+translation state, classifies each validated function call from an owned
+`TranslationContext`, and routes client-executed tools to their specific
+`ToolTranslator` implementation:
+
+- `FunctionHandler` → `FunctionTranslator`
+- `CustomHandler` → `CustomTranslator`
+- `ShellHandler` → `ShellTranslator`
+- `CodexNamespaceHandler` → `CodexNamespaceTranslator`
+- `ToolSearchHandler` → `ToolSearchTranslator`
+
+This is the reverse side of upstream canonicalization. The model emits the canonical
+`function_call` shape. For a client-owned tool, its associated translator restores the
+public Responses wire item and its SSE lifecycle (`output_item.added`, type-specific
+delta/done events, and `output_item.done`). The ordinary function translator preserves
+the function-call shape; custom, namespace, and tool-search translators restore their
+specific public forms.
+
+The private `HasTranslator` association lives in the executor so tool handlers do not
+depend on SSE or executor types. `TranslationContext` is an owned snapshot of the
+registry facts and request metadata needed for classification and restoration. It
+provides each round's tool classification and owns final restoration of public tool
+declarations, custom/namespace shapes, tool choice, and tool-search metadata.
+
+Gateway-executed types (`Mcp`, `WebSearch`, `FileSearch`, and `CodeInterpreter`) are
+classified as gateway calls by the dispatcher, which suppresses their canonical
+upstream function-call lifecycle. `gateway.rs` owns their execution result mapping and
+synthesizes their public item lifecycle because the gateway knows when execution
+starts, completes, or fails. `GatewayStreamAccumulator` then assigns cross-round
+sequence numbers, rebases output indexes, and deduplicates response start events.
+Events that arrive before a function name is known are buffered with a 256 KiB total
+byte limit and replayed when the call resolves.
+
+Shell functions are restored to `shell_call` and command SSE events for client
+execution by default. When an application registers a shell executor, the owned
+translation context carries the resolved gateway ownership so the dispatcher
+suppresses the canonical function lifecycle. The gateway event plan then emits
+the shell call’s public added/done lifecycle.
+
+#### `gateway_accumulator.rs` and `pipeline/delivery.rs` — continuous client SSE
+
+`StreamDelivery`, owned by `AgentPipeline`, withholds terminal upstream lifecycle
+events for the engine, defers frames at and after the first hidden gateway-call
+index, and later releases them in output order around synthesized gateway events.
+Deferred frames are bounded by both 1024 entries and the existing 256 KiB
+serialized-wire-data limit. This is separate from response assembly, retained
+session state, and total process memory.
+
+`pipeline/delivery.rs` owns the shared emission path for both translated upstream
+events and gateway-synthesized events. Only the upstream adapter restores response
+IDs and applies the round's output offset; gateway events already use public IDs
+and absolute indexes. Sequence and response-start deduplication state is committed
+after the bounded sender accepts the event. A failed serialization, closed receiver,
+or cancelled send cannot consume that state. Enqueueing is not client receipt or
+playback acknowledgement. Failed or cancelled frames are discarded by the caller;
+this does not make an interrupted pipeline resumable or support retrying an already
+rebased frame.
+
+While a gateway-call defer window is active, index-less frames remain deferred
+and are released after indexed frames. Flushes keep unsent frames and their byte
+accounting in `StreamDelivery` until the bounded sender accepts each event, so a
+cancelled or disconnected flush cannot silently discard the remainder.
+When an upstream round fails, the engine releases its deferred public events through
+the same delivery path before the terminal event, without executing gateway tools.
+
+Its `GatewayStreamAccumulator` carries only cross-round presentation state: monotonic
+`sequence_number`s, public `output_index` rebasing, and deduplication of response start
+events. It holds no `OutputItem` assembly state. Sending is awaited before ingestion
+continues, so sender closure or delivery failure propagates through the live pipeline.
 
 #### `gateway.rs` — the tool-loop's building blocks
 
-As noted above, the round-by-round loop itself is `engine.rs::run_gateway_tool_loop`.
-`gateway.rs` supplies what that loop calls each round:
+The round-by-round loop belongs to `engine.rs::EngineOrchestration`. `gateway.rs`
+supplies the planning, execution, projection, and continuation helpers it calls each
+round:
 - `GatewayScheduler::plan` creates one slot per gateway-owned function call. Each slot
   owns the original item index, public output index, typed `GatewayBinding`, and
   lifecycle projection; a missing executor is represented by an explicit slot rather
-  than omitted from a parallel vector. `GatewayScheduler::execute` then returns one
-  ordered `GatewayCallResult` per slot. A `futures::stream::buffered` sliding window
-  bounds fan-out using `tools.max_concurrent_gateway_calls` (default `5`, configurable
-  through `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS`). The setting is a nonzero value
-  carried by the owning `ExecutionContext` into each scheduler, so independent
-  contexts do not share process-global policy and `.buffered(0)` is unrepresentable.
-  Completion may occur out of order, but the collected result order always matches
-  model call order.
+  than omitted from a parallel vector. `GatewayScheduler::execute_with_budget` then returns one
+  ordered `GatewayCallResult` per slot. `futures::future::join_all` polls all planned
+  calls, while a `tokio::sync::Semaphore` created by each `execute_with_budget` invocation limits
+  active tool executions in that round using `tools.max_concurrent_gateway_calls`
+  (default `5`, configurable through `AGENTIC_MAX_CONCURRENT_GATEWAY_CALLS`). This
+  nonzero setting is carried by the owning `ExecutionContext` into each scheduler;
+  the permits are local to the round, not a process-wide or cross-request limit.
+  Completion may occur out of order, but `join_all` preserves model call order in
+  the collected results. The permit limit bounds execution, not the number of
+  planned call futures waiting for permits.
 - A normalized `web_search` function call may batch at most five queries. The JSON
   Schema advertises the ceiling and the handler enforces it again because normalized
   web search currently uses non-strict arguments. Provider searches acquire a shared
   handler semaphore initialized from `tools.max_concurrent_gateway_calls`, preventing
   batched calls from multiplying the configured outbound concurrency. Results remain
   collected in query order for the public `web_search_call.action.queries` projection.
-- Every call has an independent 60-second timeout. Timeout, execution, and tool-config
+- Each bound call first acquires its optional same-tool exclusion permit, then a
+  round execution permit, then a materialization permit shared by cloned scheduler
+  policies (also used by MCP discovery, with a limit of 16). Waiting for same-tool
+  exclusion does not consume a round permit; waiting for materialization does. The
+  independent 60-second timeout wraps `GatewayBinding::execute` only after all
+  permits are acquired. These permit waits do not count toward it, so it is not a
+  deadline for the entire round or total call latency. Timeout, execution, and tool-config
   failures become failed tool outputs that can be fed back to the model instead of
   failing the whole response. A tool registered as gateway-owned without an
-  implementation (currently file search/code interpreter) likewise produces an error
-  tool result.
+  implementation (currently file search) likewise produces an error tool result.
 - Parallel safety is a per-handler contract. `GatewayExecutor::supports_parallel_execution`
   defaults to `false`; registration turns that into a `GatewayBinding::self_exclusion`
   semaphore. The semaphore serializes only simultaneous calls to the **same
   model-visible tool name**. It never blocks different tools from running concurrently.
   MCP and web search opt into same-tool parallel execution.
 - Each scheduler slot retains its `GatewayEventPlan`; `emit_gateway_start_events` and
-  `emit_gateway_completed_events` synthesize the OpenAI lifecycle for gateway-executed
-  web search/MCP calls from those same slots. The ordinary path emits all planned start
-  events, executes the round concurrently, then emits ordered completed/failed events.
+  `emit_gateway_completed_events` synthesize public lifecycle events for gateway-executed
+  web search, MCP, and optional code-interpreter calls from those same slots. A code-interpreter
+  call emits `output_item.added`, `code_interpreter_call.in_progress`, the
+  `code_interpreter_call_code.delta`/`done` pair, `code_interpreter_call.interpreting`,
+  `code_interpreter_call.completed`, and `output_item.done`, with indexes and sequence numbers
+  assigned by `GatewayStreamAccumulator`. The dispatcher suppresses the canonical upstream
+  `function_call` lifecycle after classifying the call as gateway-executed. Native upstream
+  `code_interpreter_call` items instead follow the accumulator's typed lifecycle and pass through;
+  contradictory item kinds at one output index are handled by ingestion before translation. The
+  ordinary path emits all planned start events, executes the round concurrently, then emits ordered
+  completed/failed events.
 - Streaming may receive client-visible output interleaved with gateway calls. In that
   case `engine.rs::execute_and_emit_ordered_output_calls` temporarily groups deferred
   upstream frames by `output_index`, executes the same `GatewayScheduler` concurrently,
@@ -548,20 +958,85 @@ The round decision remains in `engine.rs`, after gateway execution:
 `parallel_tool_calls` is an upstream model-generation preference, not a gateway
 scheduler switch. It is forwarded to vLLM for all supported declaration mixtures and
 defaults to `false` when omitted. Whatever calls the model emits are executed under
-the global sliding window and each handler's same-tool safety policy.
+the per-round execution permit limit and each handler's same-tool safety policy.
 
-#### `messages_loop.rs` / `messages_request.rs` / `messages_stream.rs`
+#### `messages_context.rs` / `messages_loop.rs` / `messages_request.rs` / `messages_stream.rs` / `messages_tools.rs`
 
 A **parallel, independent implementation** of the same shape of loop for the Anthropic
 Messages API. `messages_stream.rs`'s own header comment describes it as "structurally
 the Anthropic-native analogue of `GatewayStreamAccumulator`, kept deliberately parallel
 for a future consolidation" — it never touches `RequestPayload`/`ResponsePayload`/
-`ResponseAccumulator`/`GatewayStreamAccumulator`/`FunctionSseTranslator`, operating
+`AgentPipeline`/`ResponseAccumulator`/`GatewayStreamAccumulator`/`TranslationDispatcher`, operating
 directly on Anthropic-shaped JSON. The two loops share only the protocol-neutral
 pieces: `ToolRegistry::dispatch` and `types::messages::tool_seam`. The round/timeout
 constants (`MAX_GATEWAY_TOOL_ROUNDS`, `GATEWAY_TOOL_TIMEOUT`) are duplicated and
 manually kept in sync with the Responses-side ones rather than shared — a known seam,
 not an oversight, per the future-consolidation note.
+
+The JSON and SSE loops read a model turn differently but dispatch its gateway calls
+through one function, `messages_tools.rs`'s `execute_gateway_calls`, so admission,
+execution, and the fed-back `tool_result`s cannot differ between them. Calls are
+admitted sequentially in model order before any of them starts, then run concurrently
+under the per-call timeout.
+
+A native `web_search_20250305` declaration's `max_uses` is a request-wide budget of
+searches, not of calls. The normalized tool sent upstream lets one call batch several
+`queries`, so a call is charged for every query the handler would run, counted by the
+handler's own argument parser. A call the remaining budget cannot cover is refused
+whole with an error `tool_result` and leaves the budget untouched, so a later call that
+fits still runs. A call whose arguments cannot be parsed performs no search and is not
+charged.
+
+Both loops take a `MessagesRequestContext` (`messages_context.rs`), the per-request
+type that replaced a bare `serde_json::Value` at that boundary. It holds two views of
+one request: typed fields for reading `tools`/`stream`/`model`, the current
+`MessagesToolChoice`, and the raw JSON body that is actually forwarded upstream. The raw body is deliberately *not*
+re-serialized from the typed view — `ContentBlock` catches unmodeled block types in
+`#[serde(other)] Unknown` and models only the fields the gateway reads, so a typed
+round-trip would drop `cache_control` and `is_error` and collapse `image`/
+`redacted_thinking` into `{"type":"unknown"}`. The context owns every mutation the
+loops make to that body (`force_stream`, `append_round`) and the native web-search
+budget, so the two views cannot drift apart uncontrolled; `messages` and `system` are
+reachable only through the raw body, never the typed view.
+
+`append_round` also changes a fulfilled forced `tool_choice` (`any`, or `tool`
+matching a returned gateway call result) to `auto`. The first round retains the
+client's selector; later rounds can answer from the tool result or choose another
+tool. Parallel-use settings and extension fields remain intact. Rounds containing
+client-executed function tools return before this mutation, and Messages does not
+persist this state.
+
+`MessagesToolChoice` models `auto`, `any`, `tool` with a non-empty name, and
+`none` as an exhaustive enum. It retains parallel-use settings and flattened
+extension fields. The context performs fulfillment checks and transitions using
+that enum, then serializes the changed selector into the raw body. Malformed
+gateway-tool requests return HTTP 400 before inference; a parse failure cannot
+bypass validation by falling back to the proxy. Requests without gateway tools
+retain the transparent proxy contract and upstream validation.
+
+vLLM can label a completed, explicitly named tool call `end_turn`. The shared
+request context accepts that stop only when the selected gateway tool appears in
+the round. Streaming additionally requires `message_stop`; client-executed
+function tools and truncated rounds remain terminal. A completed client-executed
+`tool_use` is surfaced with public `stop_reason: tool_use`, correcting vLLM's
+`end_turn` in JSON and the final SSE `message_delta`. Mixed rounds hide gateway
+calls and await the client's output. Token limits, other stop reasons and streams
+without a completed round keep their original terminal semantics.
+
+Hide-the-call covers every terminal round, not only a mixed one. A round can end while a
+gateway `tool_use` is present whenever the stop reason is not a tool-call stop — a
+`max_tokens` truncation mid-call, or an `end_turn` the context does not accept — and that
+call is never executed. `messages_loop.rs`'s `deliver` strips gateway-owned `tool_use`
+blocks from the returned message, matching the streaming accumulator, which suppresses them
+on every round. The assistant turn fed back to the model still carries the call.
+
+Each round's `usage` is folded into `messages_usage.rs`'s `MessagesUsageTotals`, so when
+hidden gateway rounds ran, the returned message (JSON) and the terminal `message_delta` (SSE)
+report the saturating sum of the Anthropic token counters across every round rather than the
+final round alone. A streamed round counts its `message_start.usage` overlaid by its
+`message_delta.usage`. Counters no round reported stay absent, the remaining `usage` fields
+pass through from the final round, a single-round turn is returned unchanged, and a final
+round that omits `usage` still reports the hidden rounds' counters.
 
 ### `storage/` — persistence
 
@@ -572,14 +1047,20 @@ not an oversight, per the future-consolidation note.
   connection URL, plus URL redaction for safe logging.
 - **`schema.rs`** — migrations and readiness (`PoolWithSchema::ensure_schema_ready`),
   including a path for a supervisor-managed schema that skips running migrations
-  itself and just verifies compatibility.
+  itself and just verifies compatibility. Readiness probes live in `schema/readiness.rs`.
+- **`conversation/api.rs`** — tenant-scoped conversation and item CRUD. Item ownership is checked through
+  the conversation so Responses-persisted items are visible too. Item writes share `lock_in_tx` with
+  turn persistence; a monotonic conversation revision makes deletions invalidate active snapshots.
+  Removal detaches items rather than destroying history referenced by stored responses.
 - **`models/`** — raw `sqlx::FromRow` row structs per table (`Conversation`, `Item`,
   `Response`) plus their raw, transaction-aware SQL functions (`create_in_tx`, `get`,
   `lock_in_tx`, ...). This is the literal DB row shape: JSON columns are still strings
   here.
 - **`types/`** — the conversion layer from those raw rows into business types, via
   `From`/`TryFrom` impls: `ConversationData`/`ConversationSnapshot`, `ResponseData`/
-  `ResponseMetadata` (parses the JSON metadata column into a typed struct),
+  `ResponseMetadata` (parses the JSON metadata column into a typed struct, including an optional
+  terminal `ResponsePayload` snapshot for GET retrieval and a versioned multi-agent
+  tree checkpoint for continuation),
   `InOutItem` (parses an `Item.data` JSON blob back into a typed `InputItem` or
   `OutputItem`), and `StorageError`. `InOutItem::into_input_items` turns a full
   history into the `Vec<InputItem>` used for continuation processing: stored
@@ -597,8 +1078,8 @@ not an oversight, per the future-consolidation note.
   upstream request, `RequestPayload::to_upstream_request` calls
   `ResponsesInput::model_input()`: the latest compaction checkpoint is converted to an
   assistant summary and supersedes older context, while compaction triggers and MCP
-  list-tools records are removed. In particular, MCP list-tools remains available long
-  enough for the registry to remember which server labels have already been listed,
+  list-tools records and public collaboration items are removed. In particular, MCP
+  list-tools remains available long enough for the registry to remember which server labels have already been listed,
   but it is never serialized to vLLM.
 - **`conversation.rs`, `response.rs`** — `ConversationStore` and `ResponseStore`: the
   CRUD-with-transactions layer (`create`, `get`, `get_or_create`, `rehydrate[_snapshot]`,
@@ -609,18 +1090,64 @@ not an oversight, per the future-consolidation note.
   them directly for fixtures — that's expected and fine; production code paths should
   not.)
 
+Stored Responses snapshots are written in the same transaction as response history. Retrieval goes through
+`ResponseHandler::retrieve`, independently of upstream availability. Continuation checkpoints omit the
+snapshot to avoid retaining a duplicate response; they continue to use canonical history and effective
+settings. Legacy history-only records remain usable for continuation, but GET retrieval reports a conflict
+rather than fabricating status, usage, or output.
+
 ### `tool/` — the tool framework
 
 Wire shapes for tool declarations live in `types::tools` (see above); this module owns
 the behavioral layer — routing, handler traits, normalization, and execution.
 
+Every supported tool, whether client-owned or gateway-owned, implements `ToolHandler`.
+That trait is the authority for validating a public declaration and normalizing it to
+the fixed `FunctionTool` format understood by the upstream model. The outbound path is:
+
+```text
+public ResponsesTool declaration
+        │
+        ▼
+RequestPayload::to_upstream_request
+        │
+        ├─▶ ResponsesTool::validate ──────────▶ ToolHandler::validate
+        └─▶ ResponsesTool::to_function_tools ─▶ ToolHandler::normalize
+                                                     │
+                                                     ▼
+                                      canonical UpstreamTool::Function
+```
+
+`RequestPayload::to_upstream_request` is the only request-level seam that prepares
+tools for vLLM. New callers must use it rather than rebuilding function schemas or
+normalizing declarations in the executor. Declared placeholders that are not yet
+supported, currently file search, produce no upstream function declaration until they
+have a complete handler and execution path. Code interpreter has a fixed
+normalization contract in every build. Requests that declare it fail before
+inference unless the binary includes the `embedded-code-interpreter` feature,
+the operator enables it, and Eryx runtime readiness succeeds.
+
+| Component | Responsibility |
+| --- | --- |
+| `ToolHandler` | Validate one supported public tool declaration and normalize it into one or more canonical model-visible `FunctionTool`s. |
+| `ToolRegistry` | Provide the request's read-only name lookup for all available tools, including tool type, client/gateway ownership, server label, and any typed gateway binding. |
+| Client `ToolTranslator` | Convert a validated canonical function call back to that client-owned tool's public output shape and SSE lifecycle. |
+| `GatewayExecutor` and `gateway.rs` | Execute gateway-owned calls and map their start, completion, failure, result, and public output lifecycle. |
+| `GatewayStreamAccumulator` | Project gateway and upstream lifecycle frames into one continuous, correctly indexed and sequenced client stream. |
+
 - **`normalize.rs`** — the `impl ResponsesTool` block with `validate()` and
-  `to_function_tools()`. Both are a match over the tool-kind enum that delegates to
-  each type's `ToolHandler`: e.g. `Function` → `FunctionHandler`, `Mcp` → `McpHandler`,
-  `Namespace` → `CodexNamespaceHandler`, `Custom` → `CustomHandler`. `WebSearch` is
-  normalized inline from a static builder (single fixed tool, no per-instance state).
-  `FileSearch`/`CodeInterpreter` are declared but currently normalize to nothing — no
-  handler is registered yet.
+  `to_function_tools()`. These are the declaration-level validation and normalization
+  entry points used by `RequestPayload::to_upstream_request`. Each supported variant's
+  policy belongs to its corresponding `ToolHandler`: `FunctionHandler`,
+  `ToolSearchHandler`, `McpHandler`, `WebSearchHandler`, `CodexNamespaceHandler`,
+  `CustomHandler`, or `CodeInterpreterHandler`. Web search's fixed canonical builder
+  is shared with `WebSearchHandler::normalize`; it remains one schema even though it has no
+  per-declaration normalization state. The method name is plural because namespace and
+  MCP declarations may expand to several model-visible function tools.
+  `FileSearch` remains an unsupported placeholder and normalizes to nothing. The
+  code interpreter normalizes to one fixed function contract in every build, while
+  request validation rejects unavailable runtimes before upstream inference.
+  Feature-enabled builds bind the ready private `CodeInterpreterExecutor` to the provider.
 - **`handler.rs`** — the two traits every tool type reasons about:
   ```rust
   pub trait ToolHandler: Send + Sync {
@@ -659,6 +1186,8 @@ the behavioral layer — routing, handler traits, normalization, and execution.
   ```
   `GatewayExecutor` requires `ToolHandler`: every executable gateway handler supports
   typed validation and normalization, but not every `ToolHandler` is gateway-executable.
+  This inheritance is the ownership invariant: supported client and gateway tools
+  share the same declaration contract before execution ownership matters.
   `ToolParams` describes the public declaration; `ExecutionParams` describes one
   model-visible executable entry. They intentionally differ for MCP: an
   `McpToolParam` declares a server, while an `McpDiscoveredToolParam` identifies one
@@ -667,13 +1196,16 @@ the behavioral layer — routing, handler traits, normalization, and execution.
   controls same-tool self-exclusion, `plan_gateway_events()` creates the typed public
   lifecycle projection, and `public_output()` shapes the completed/failed
   client-visible item.
-  - **Client-owned** tools implement only `ToolHandler`: see `function.rs`
-    (`FunctionHandler`), `custom.rs` (`CustomHandler`), `codex.rs`
-    (`CodexNamespaceHandler`). Their calls are returned for the client to resolve — the
-    gateway never executes them.
-  - **Gateway-owned / built-in** tools implement both traits: see `web_search.rs`
-    (`WebSearchHandler`, backed by You.com) and `mcp/handler.rs` (`McpHandler`, backed
-    by `mcp/client.rs`'s MCP protocol client and `mcp/pool.rs`'s connection pool).
+  - **Client-owned** tools implement `ToolHandler` and have a translator association:
+    see `function.rs` (`FunctionHandler`), `custom.rs` (`CustomHandler`), `codex.rs`
+    (`CodexNamespaceHandler`), and `tool_search.rs` (`ToolSearchHandler`). Their calls
+    are returned for the client to resolve; the gateway does not execute them.
+  - **Gateway-owned / built-in** tools implement both traits: see `web_search/mod.rs`
+    (`WebSearchHandler`, backed by the configured `WebSearchProvider` in `web_search/you.rs`,
+    `web_search/brave.rs`, or `web_search/tavily.rs`) and `mcp/handler.rs` (`McpHandler`, backed
+    by `mcp/client.rs`'s MCP protocol client and `mcp/pool.rs`'s connection pool). They
+    have no client translator association because the gateway owns their execution and
+    public lifecycle.
 - **`ownership.rs`** — `ToolOwnership::Client` versus
   `ToolOwnership::Gateway(Option<GatewayBinding>)`. A `GatewayBinding` combines the
   resolved executor, its typed `ExecutionParams`, and the optional same-tool semaphore
@@ -683,8 +1215,12 @@ the behavioral layer — routing, handler traits, normalization, and execution.
   configuration or downcasts. Keeping ownership explicit avoids inferring execution
   policy from whether a handler happens to be present.
 - **`registry.rs`** — `ToolRegistry`, a request-scoped map from model-visible tool name
-  to `ToolEntry { tool_type, server_label, ownership }`. Executable parameters live in
-  the typed `GatewayBinding`, not as a serialized `Value` on every entry. Its constructor,
+  to `ToolEntry { tool_type, server_label, ownership }`. Its responsibility is to keep
+  the read-only catalog of every available model-visible tool for the request,
+  including declared client tools, namespace members, built-ins, and discovered MCP
+  tools. A lookup answers which tool type a name identifies and whether its ownership
+  is `Client` or `Gateway`; a gateway entry may also carry its typed
+  `GatewayBinding`. Its constructor,
   ```rust
   pub async fn build_with_handlers(
       tools: &mut [ResponsesTool],
@@ -698,7 +1234,10 @@ the behavioral layer — routing, handler traits, normalization, and execution.
   `tools/list` in the process). `ToolRegistry::dispatch(call)` is the per-call routing
   method the Messages loop uses; the Responses `GatewayScheduler` resolves the same
   binding into one call plan so execution, self-exclusion, item position, and lifecycle
-  hooks cannot drift apart.
+  hooks cannot drift apart. After construction, consumers query this catalog for
+  classification, ownership, and gateway bindings. `upstream.rs` snapshots its
+  classification facts into a per-round `TranslationContext`, which translators use
+  when restoring client-owned tool calls.
 
   MCP discovery history is also request-scoped registry state:
   `mcp_list_tools_items: HashMap<String, Vec<McpListTools>>` groups records by
@@ -713,21 +1252,33 @@ the behavioral layer — routing, handler traits, normalization, and execution.
   reused across requests, specifically for gateway tools that need **lazy, per-request
   connection setup**: MCP servers (connects and caches `McpClient`s keyed by server
   URL, falling back to connecting a fresh request-declared server) and the shared
-  `WebSearchHandler`. As of today it only has slots for `ToolType::Mcp` and
-  `ToolType::WebSearch`; `GatewayExecutorRegistration` has typed variants for those
-  supported slots. Client-owned
+  `WebSearchHandler`. It also has an optional, application-provided `ShellExecutor`
+  slot. `GatewayExecutorRegistration::Shell` is an explicit execution grant; an
+  unregistered shell declaration remains client-executed. `ShellExecutor` accepts
+  a typed call with bounded action limits and cancellation and returns typed command
+  outputs. The adapter binds into the existing gateway scheduler, not a second tool loop.
+  Client-owned
   tools (`function`, `custom`, `namespace`) never touch this file; their registry
   entries are inserted with `ToolOwnership::Client` and no `GatewayExecutors`
   involvement.
 
+Shell item history is preserved publicly in storage. At the inference boundary,
+`ShellHandler::model_input` lowers shell calls and outputs into matching function
+history, just as declarations and explicit shell selectors are normalized. For an
+opt-in gateway executor, storage additionally retains the canonical internal function
+call/output pair; rehydration omits that pair's public shell-call projection to avoid
+replaying the invocation twice. Client-executed shell history is not omitted.
+
 **To add a new tool type:**
-1. Implement `ToolHandler`, including its typed `ToolParams`, for it. If it's client-executed,
-   stop there — see `function.rs`/`custom.rs` for the pattern.
+1. Implement `ToolHandler`, including its typed `ToolParams`, for it.
 2. If it's gateway-executed, also declare typed `GatewayExecutor::ExecutionParams`
-   and implement `execute` — see `web_search.rs`/`mcp/handler.rs`.
+   and implement `execute` — see `web_search/mod.rs`/`mcp/handler.rs`.
 3. Wire it into `tool/normalize.rs`'s `validate`/`to_function_tools` match arms.
 4. Wire it into `tool/registry.rs`'s `build_with_handlers` (an `insert_*_entry` call).
-5. If it needs lazy per-request connection setup, add a slot to `GatewayExecutors` in
+5. For a client-executed function shape, add its `ToolTranslator` and associate the
+   handler in `executor/translate/client.rs`. Gateway-executed tools do not receive a
+   translator association; their public events come from gateway lifecycle plans.
+6. If it needs lazy per-request connection setup, add a slot to `GatewayExecutors` in
    `tool/executors.rs` and reference it from the registry's match arm for that type.
 
 ## `agentic-praxis`
@@ -743,14 +1294,16 @@ router, reusing the same core logic in-process.
 | Task | Where |
 |---|---|
 | Add a new HTTP or WebSocket route | `agentic-server/src/handler/{http,websocket}/`, wire it in `app.rs`'s `build_router_with_auth` |
-| Support a new upstream SSE event | `events/types.rs` → `events/normalize.rs` → the single ingestion dispatcher tracked by [#243](https://github.com/vllm-project/agentic-api/issues/243); do not add a caller-specific path |
-| Add a new tool type | `tool/handler.rs` impl(s) → `tool/normalize.rs` → `tool/registry.rs` → `tool/executors.rs` if it needs lazy connection setup |
+| Support a new upstream SSE event | `events/types.rs` → `events/normalize.rs` → `executor/accumulator/` → `executor/translate/` when the event needs public tool-shape translation |
+| Add a new tool type | `tool/handler.rs` impl(s) → `tool/normalize.rs` → `tool/registry.rs` → `executor/translate/client.rs` for client-executed function shapes → `tool/executors.rs` for lazy gateway setup |
 | Change gateway-round concurrency or lifecycle ordering | `executor/gateway.rs` (`GatewayScheduler`/event plans) + `executor/engine.rs` (round decision/ordered streaming) + `tool/ownership.rs` (typed binding and same-tool safety) |
-| Change client streaming order, buffering, or backpressure | The stream-relay boundary tracked by [#244](https://github.com/vllm-project/agentic-api/issues/244); do not add it to `inference.rs` or the response accumulator |
+| Change agent admission, mailbox wakeups or client continuation routing | `executor/engine/multi_agent/` + `executor/multi_agent/`; keep tree persistence in the existing mode handlers |
+| Change client streaming order, buffering, or backpressure | `executor/pipeline/delivery.rs`; keep parsing in `events/` and response assembly in `executor/accumulator/` |
 | Move streaming ingestion to a worker | Benchmark the equivalent inline and worker paths under [#245](https://github.com/vllm-project/agentic-api/issues/245) before changing executor placement |
+| Feed response output into the next inference round | `types/io/output.rs::OutputItem::to_input_item`; use `executor/gateway.rs::append_output_items_to_input` only to append those converted items |
 | Change continuation history visibility | `storage/types/item.rs::into_input_items` → `types/io/output.rs::to_input_item` (preservation) → `types/io/input.rs::model_input` (upstream visibility) |
 | Add a CRUD operation beyond persist/rehydrate | `executor/modes/conversation.rs` or `modes/response.rs`, backed by `storage/conversation.rs` / `storage/response.rs` |
-| Change how output items are assembled from a stream | `executor/accumulator.rs` — respect the `TryFrom`/`ApplyDone` pattern, don't add new public methods |
+| Change how output items are assembled from a stream | `executor/accumulator/` — extend the typed slot and transition matches through the existing `RoundIngestion` path |
 | Add a new Responses/Messages wire field | `types/io/` or `types/messages/` — shape only, no behavior |
 
 ## Further reading

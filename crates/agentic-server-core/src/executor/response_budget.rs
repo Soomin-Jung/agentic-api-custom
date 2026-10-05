@@ -1,32 +1,847 @@
+//! Cumulative retained-byte budget for one Responses request.
+//!
+//! Two owners share this module. [`ExecutorResponseBudget`] is the per-request
+//! ceiling, charged by synchronous ingestion for retained output items and by
+//! the gateway for tool outputs. [`RetainedSize`] is the single measurement of
+//! how many bytes an output item keeps in memory; ingestion charges growth
+//! incrementally and reconciles against this measurement at completion, so a
+//! new variable-sized field is added in exactly one place.
+mod client_outputs;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::executor::error::{ExecutorError, ExecutorResult};
+use serde_json::Value;
 
-pub(super) const MAX_EXECUTOR_RESPONSE_BYTES: usize = 1024 * 1024;
+use crate::executor::error::{ExecutorError, ExecutorResult, ResourceLimit};
+use crate::types::io::output::{McpListTool, McpListTools, McpToolExecutionError, ReasoningTextContent};
+use crate::types::io::{
+    AgentAttribution, AgentMessage, AgentMessageContent, CodeInterpreterCall, CodeInterpreterCallOutput,
+    CompactionItem, CustomToolCall, FunctionToolCall, McpCall, McpCallError, MultiAgentCall, MultiAgentCallOutput,
+    MultiAgentCallOutputContent, OutputItem, OutputMessage, OutputMessageContent, OutputTextContent, OutputTextLogprob,
+    ReasoningOutput, ShellCall, ToolSearchCall, TopLogprob, WebSearchAction, WebSearchCall,
+};
+use crate::types::request_response::IncompleteDetails;
+#[cfg(test)]
+use crate::types::request_response::ResponsePayload;
 
-#[derive(Clone)]
+#[cfg(test)]
+pub use crate::config::DEFAULT_MAX_RETAINED_RESPONSE_BYTES;
+#[cfg(test)]
+pub(super) const MAX_EXECUTOR_RESPONSE_BYTES: usize = DEFAULT_MAX_RETAINED_RESPONSE_BYTES;
+
+/// Fixed charge for every retained container: an output item, a content part,
+/// a shell command, a JSON array or object. It bounds structural growth that
+/// carries no text, such as an empty content part.
+pub(super) const RETAINED_CONTAINER_OVERHEAD_BYTES: usize = 32;
+
+#[derive(Clone, Debug)]
 pub(super) struct ExecutorResponseBudget {
-    remaining: Arc<AtomicUsize>,
+    limit: usize,
+    used: Arc<AtomicUsize>,
 }
 
 impl ExecutorResponseBudget {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
+        Self::with_limit(MAX_EXECUTOR_RESPONSE_BYTES)
+    }
+
+    pub(super) fn with_limit(limit: usize) -> Self {
         Self {
-            remaining: Arc::new(AtomicUsize::new(MAX_EXECUTOR_RESPONSE_BYTES)),
+            limit,
+            used: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
     pub(super) fn consume(&self, bytes: usize) -> ExecutorResult<()> {
-        self.remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(bytes)
+        let limit = self.limit;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let next = used.checked_add(bytes)?;
+                if next > limit { None } else { Some(next) }
             })
             .map(|_| ())
-            .map_err(|_| {
-                ExecutorError::StreamError(format!(
-                    "executor response budget exceeded {MAX_EXECUTOR_RESPONSE_BYTES} bytes"
-                ))
+            .map_err(|_| ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                max_bytes: limit,
             })
+    }
+}
+
+/// Bytes accounted so far for one retained slot, and the only way to change them.
+///
+/// Every lifecycle operation uses one of three moves:
+/// - [`charge`](Self::charge) for growth known before it happens (a delta, a new
+///   container), checked against the budget before the state grows;
+/// - [`grow`](Self::grow) for a mutation whose retained growth is only known by
+///   measuring the affected state before and after, so accounting observes the
+///   same completion policy that mutates the item instead of re-deriving it;
+/// - [`reconcile`](Self::reconcile) for a comprehensive measurement of the
+///   completed item, charging only what incremental accounting has not yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct RetainedAccount {
+    accounted: usize,
+}
+
+impl RetainedAccount {
+    #[cfg(test)]
+    pub(super) fn accounted(self) -> usize {
+        self.accounted
+    }
+
+    /// Charge growth that is known before the retained state grows.
+    pub(super) fn charge(&mut self, budget: Option<&ExecutorResponseBudget>, bytes: usize) -> ExecutorResult<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        if let Some(budget) = budget {
+            budget.consume(bytes)?;
+        }
+        self.accounted = self.accounted.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Apply `mutate` and charge the measured growth of `state`.
+    ///
+    /// `measure` must cover every field `mutate` can grow; measuring a superset
+    /// is harmless. A rejected charge fails the round, so the state that grew
+    /// past the budget is dropped with it and the overshoot is bounded by the
+    /// single payload that caused it.
+    pub(super) fn grow<T>(
+        &mut self,
+        budget: Option<&ExecutorResponseBudget>,
+        state: &mut T,
+        measure: impl Fn(&T) -> usize,
+        mutate: impl FnOnce(&mut T),
+    ) -> ExecutorResult<()> {
+        let before = measure(state);
+        mutate(state);
+        let after = measure(state);
+        self.charge(budget, after.saturating_sub(before))
+    }
+
+    /// Bring the account up to a comprehensive measurement of the retained item.
+    ///
+    /// Incremental accounting may exceed the measurement (a discarded empty
+    /// part, a streamed buffer superseded by its completion); it never refunds.
+    pub(super) fn reconcile(&mut self, budget: Option<&ExecutorResponseBudget>, measured: usize) -> ExecutorResult<()> {
+        self.charge(budget, measured.saturating_sub(self.accounted))
+    }
+}
+
+/// Bytes an item keeps in executor memory once retained.
+///
+/// Counts every variable-sized field (identifiers, text, arguments, nested
+/// JSON) plus [`RETAINED_CONTAINER_OVERHEAD_BYTES`] per container or JSON value.
+/// Only fields represented by bounded enums are excluded. String-valued types,
+/// roles, and statuses are measured even when their usual vocabulary is fixed.
+pub(in crate::executor) trait RetainedSize {
+    fn retained_bytes(&self) -> usize;
+}
+
+fn opt_len(value: Option<&String>) -> usize {
+    value.map_or(0, String::len)
+}
+
+fn sum_retained<'a, T: RetainedSize + 'a>(items: impl IntoIterator<Item = &'a T>) -> usize {
+    items.into_iter().map(RetainedSize::retained_bytes).sum()
+}
+
+impl RetainedSize for Value {
+    /// Approximates the serialized footprint of arbitrary JSON without serializing it.
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + match self {
+                Value::Null => 4,
+                Value::Bool(_) => 5,
+                Value::Number(_) => 8,
+                Value::String(text) => text.len(),
+                Value::Array(items) => sum_retained(items),
+                Value::Object(map) => map
+                    .iter()
+                    .map(|(key, value)| key.len() + value.retained_bytes())
+                    .sum::<usize>(),
+            }
+    }
+}
+
+impl<T: RetainedSize> RetainedSize for Option<T> {
+    fn retained_bytes(&self) -> usize {
+        self.as_ref().map_or(0, RetainedSize::retained_bytes)
+    }
+}
+
+impl RetainedSize for IncompleteDetails {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + opt_len(self.reason.as_ref())
+    }
+}
+
+impl RetainedSize for OutputTextContent {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + "output_text".len()
+            + self.text.len()
+            + self.annotations.as_ref().map_or(0, sum_retained)
+            + self.logprobs.as_ref().map_or(0, sum_retained)
+    }
+}
+
+impl RetainedSize for OutputMessage {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.role.len()
+            + sum_retained(&self.content)
+    }
+}
+
+impl RetainedSize for FunctionToolCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.call_id.len()
+            + self.name.len()
+            + opt_len(self.namespace.as_ref())
+            + self.arguments.len()
+    }
+}
+
+impl RetainedSize for CustomToolCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.call_id.len()
+            + self.name.len()
+            + self.input.len()
+    }
+}
+
+impl RetainedSize for CodeInterpreterCallOutput {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + match self {
+                Self::Logs { logs } => logs.len(),
+                Self::Image { url } => url.len(),
+            }
+    }
+}
+
+impl RetainedSize for CodeInterpreterCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.container_id.len()
+            + self.code.len()
+            + self
+                .outputs
+                .as_ref()
+                .map_or(0, |outputs| RETAINED_CONTAINER_OVERHEAD_BYTES + sum_retained(outputs))
+    }
+}
+
+impl RetainedSize for ShellCall {
+    fn retained_bytes(&self) -> usize {
+        let commands = self
+            .action
+            .commands
+            .iter()
+            .map(|command| RETAINED_CONTAINER_OVERHEAD_BYTES + command.len())
+            .sum::<usize>();
+        let extras = self
+            .extra
+            .iter()
+            .chain(self.action.extra.iter())
+            .map(|(key, value)| key.len() + value.retained_bytes())
+            .sum::<usize>();
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + opt_len(self.id.as_ref())
+            + self.call_id.len()
+            + commands
+            + extras
+    }
+}
+
+impl RetainedSize for ReasoningTextContent {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.type_.len() + self.text.len()
+    }
+}
+
+impl RetainedSize for ReasoningOutput {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + opt_len(self.status.as_ref())
+            + self.encrypted_content.retained_bytes()
+            + sum_retained(&self.content)
+            + sum_retained(&self.summary)
+    }
+}
+
+impl RetainedSize for ToolSearchCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.call_id.len()
+            + self.arguments.retained_bytes()
+    }
+}
+
+impl RetainedSize for WebSearchAction {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Search(search) => {
+                search.type_.len()
+                    + search.query.len()
+                    + search
+                        .queries
+                        .iter()
+                        .map(|query| RETAINED_CONTAINER_OVERHEAD_BYTES + query.len())
+                        .sum::<usize>()
+                    + search
+                        .sources
+                        .iter()
+                        .map(|source| {
+                            RETAINED_CONTAINER_OVERHEAD_BYTES + source.url.len() + opt_len(source.title.as_ref())
+                        })
+                        .sum::<usize>()
+            }
+            Self::OpenPage(open) => opt_len(open.url.as_ref()),
+            Self::FindInPage(find) => find.pattern.len() + find.url.len(),
+        }
+    }
+}
+
+impl RetainedSize for WebSearchCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.agent.retained_bytes() + self.id.len() + self.action.retained_bytes()
+    }
+}
+
+impl RetainedSize for McpToolExecutionError {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.type_.len()
+            + self
+                .content
+                .iter()
+                .map(|content| {
+                    RETAINED_CONTAINER_OVERHEAD_BYTES
+                        + content.type_.len()
+                        + content.text.len()
+                        + content.annotations.retained_bytes()
+                        + content.meta.retained_bytes()
+                })
+                .sum::<usize>()
+    }
+}
+
+impl RetainedSize for McpCallError {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Text(text) => text.len(),
+            Self::ToolExecution(error) => error.retained_bytes(),
+            Self::Unknown(value) => value.retained_bytes(),
+        }
+    }
+}
+
+impl RetainedSize for McpCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.server_label.len()
+            + self.name.len()
+            + self.arguments.len()
+            + opt_len(self.approval_request_id.as_ref())
+            + opt_len(self.output.as_ref())
+            + self.error.retained_bytes()
+    }
+}
+
+impl RetainedSize for McpListTool {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.name.len()
+            + opt_len(self.description.as_ref())
+            + self.input_schema.retained_bytes()
+            + self.annotations.retained_bytes()
+    }
+}
+
+impl RetainedSize for McpListTools {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + self.id.len()
+            + self.server_label.len()
+            + opt_len(self.error.as_ref())
+            + sum_retained(&self.tools)
+    }
+}
+
+impl RetainedSize for CompactionItem {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.agent.retained_bytes()
+            + opt_len(self.id.as_ref())
+            + self.encrypted_content.len()
+    }
+}
+
+impl RetainedSize for AgentAttribution {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.agent_name.len()
+    }
+}
+
+impl RetainedSize for OutputMessageContent {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::InputText(part) => "input_text".len() + part.retained_bytes(),
+            Self::OutputText(part) => part.retained_bytes(),
+        }
+    }
+}
+
+impl RetainedSize for TopLogprob {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.token.len() + self.bytes.len()
+    }
+}
+
+impl RetainedSize for OutputTextLogprob {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES + self.token.len() + self.bytes.len() + sum_retained(&self.top_logprobs)
+    }
+}
+
+impl RetainedSize for MultiAgentCall {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.id.len()
+            + self.call_id.len()
+            + self.arguments.len()
+            + self.agent.retained_bytes()
+    }
+}
+
+impl RetainedSize for MultiAgentCallOutputContent {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::OutputText(part) => part.retained_bytes(),
+        }
+    }
+}
+
+impl RetainedSize for MultiAgentCallOutput {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.id.len()
+            + self.call_id.len()
+            + sum_retained(&self.output)
+            + self.agent.retained_bytes()
+    }
+}
+
+impl RetainedSize for AgentMessageContent {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::InputText(part) | Self::Text(part) | Self::SummaryText(part) | Self::ReasoningText(part) => {
+                part.retained_bytes()
+            }
+            Self::OutputText(part) => part.retained_bytes(),
+            Self::InputImage(part) | Self::ComputerScreenshot(part) => part.retained_bytes(),
+            Self::InputFile(part) => part.retained_bytes(),
+            Self::Refusal(part) => {
+                RETAINED_CONTAINER_OVERHEAD_BYTES
+                    + part.refusal.len()
+                    + part
+                        .extra
+                        .iter()
+                        .map(|(key, value)| key.len() + value.retained_bytes())
+                        .sum::<usize>()
+            }
+            Self::EncryptedContent { encrypted_content } => RETAINED_CONTAINER_OVERHEAD_BYTES + encrypted_content.len(),
+        }
+    }
+}
+
+impl RetainedSize for AgentMessage {
+    fn retained_bytes(&self) -> usize {
+        RETAINED_CONTAINER_OVERHEAD_BYTES
+            + self.id.len()
+            + self.author.len()
+            + self.recipient.len()
+            + sum_retained(&self.content)
+            + self.agent.retained_bytes()
+    }
+}
+
+impl RetainedSize for OutputItem {
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Message(item) => item.retained_bytes(),
+            Self::FunctionCall(item) => item.retained_bytes(),
+            Self::CodeInterpreterCall(item) => item.retained_bytes(),
+            Self::CustomToolCall(item) => item.retained_bytes(),
+            Self::ShellCall(item) => item.retained_bytes(),
+            Self::Reasoning(item) => item.retained_bytes(),
+            Self::ToolSearchCall(item) => item.retained_bytes(),
+            Self::WebSearchCall(item) => item.retained_bytes(),
+            Self::McpCall(item) => item.retained_bytes(),
+            Self::McpListTools(item) => item.retained_bytes(),
+            Self::Compaction(item) => item.retained_bytes(),
+            Self::MultiAgentCall(item) => item.retained_bytes(),
+            Self::MultiAgentCallOutput(item) => item.retained_bytes(),
+            Self::AgentMessage(item) => item.retained_bytes(),
+            Self::Unknown => RETAINED_CONTAINER_OVERHEAD_BYTES,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::executor) fn retained_output_item_bytes(item: &OutputItem) -> usize {
+    item.retained_bytes()
+}
+
+pub(in crate::executor) fn retained_response_parts_bytes(response_id: &str, output: &[OutputItem]) -> usize {
+    RETAINED_CONTAINER_OVERHEAD_BYTES + response_id.len() + sum_retained(output)
+}
+
+#[cfg(test)]
+pub(in crate::executor) fn retained_response_bytes(response: &ResponsePayload) -> usize {
+    retained_response_parts_bytes(&response.id, &response.output)
+        + response.incomplete_details.retained_bytes()
+        + response.error.retained_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::io::output::{
+        McpListTool, McpListTools, ReasoningOutput, ReasoningTextContent, WebSearchActionOpenPage,
+        WebSearchActionSearch, WebSearchCall, WebSearchCallStatus,
+    };
+    use crate::types::io::{CodeInterpreterCallStatus, McpCall, McpCallStatus};
+
+    #[test]
+    fn retained_accounting_for_code_interpreter_call_and_outputs() {
+        let call = OutputItem::CodeInterpreterCall(CodeInterpreterCall {
+            agent: None,
+            id: "ci_1".to_owned(),
+            container_id: "cntr_1".to_owned(),
+            code: "print(42)".to_owned(),
+            status: CodeInterpreterCallStatus::Completed,
+            outputs: Some(vec![
+                CodeInterpreterCallOutput::logs("42\n".to_owned()),
+                CodeInterpreterCallOutput::Image {
+                    url: "https://example.test/plot.png".to_owned(),
+                },
+            ]),
+            origin: crate::types::io::code_interpreter::CodeInterpreterCallOrigin::default(),
+        });
+
+        assert_eq!(
+            retained_output_item_bytes(&call),
+            RETAINED_CONTAINER_OVERHEAD_BYTES * 4
+                + "ci_1".len()
+                + "cntr_1".len()
+                + "print(42)".len()
+                + "42\n".len()
+                + "https://example.test/plot.png".len()
+        );
+    }
+
+    #[test]
+    fn agent_message_parts_charge_media_text_and_extension_fields() {
+        for (mut wire, field) in [
+            (serde_json::json!({"type":"input_text","text":""}), "text"),
+            (serde_json::json!({"type":"output_text","text":""}), "text"),
+            (serde_json::json!({"type":"text","text":""}), "text"),
+            (serde_json::json!({"type":"summary_text","text":""}), "text"),
+            (serde_json::json!({"type":"reasoning_text","text":""}), "text"),
+            (serde_json::json!({"type":"input_image","image_url":""}), "image_url"),
+            (
+                serde_json::json!({"type":"computer_screenshot","image_url":""}),
+                "image_url",
+            ),
+            (serde_json::json!({"type":"input_file","file_data":""}), "file_data"),
+            (serde_json::json!({"type":"refusal","refusal":""}), "refusal"),
+            (
+                serde_json::json!({"type":"encrypted_content","encrypted_content":""}),
+                "encrypted_content",
+            ),
+        ] {
+            let small: AgentMessageContent = serde_json::from_value(wire.clone()).unwrap();
+            wire[field] = serde_json::json!("x".repeat(1024));
+            let large: AgentMessageContent = serde_json::from_value(wire).unwrap();
+            assert_eq!(large.retained_bytes() - small.retained_bytes(), 1024);
+            assert!(small.retained_bytes() >= RETAINED_CONTAINER_OVERHEAD_BYTES);
+        }
+        let empty: AgentMessageContent = serde_json::from_value(serde_json::json!({
+            "type":"computer_screenshot","detail":"high"}))
+        .unwrap();
+        let extended: AgentMessageContent = serde_json::from_value(serde_json::json!({
+            "type":"computer_screenshot","detail":"high","extension":"x".repeat(1024)}))
+        .unwrap();
+        assert!(extended.retained_bytes() >= empty.retained_bytes() + 1024);
+    }
+
+    #[test]
+    fn attribution_collaboration_and_logprobs_are_charged() {
+        let mut message = OutputMessage::new("msg_test", crate::types::event::MessageStatus::Completed);
+        let base = message.retained_bytes();
+        message.agent = Some(AgentAttribution {
+            agent_name: "/root/review".into(),
+        });
+        assert_eq!(
+            message.retained_bytes() - base,
+            RETAINED_CONTAINER_OVERHEAD_BYTES + "/root/review".len()
+        );
+        let mut part = OutputTextContent::new("OK");
+        let base = part.retained_bytes();
+        part.logprobs = Some(vec![OutputTextLogprob {
+            token: "OK".into(),
+            bytes: vec![79, 75],
+            logprob: -0.5,
+            top_logprobs: vec![TopLogprob {
+                token: "NO".into(),
+                bytes: vec![78, 79],
+                logprob: -1.5,
+            }],
+        }]);
+        assert_eq!(part.retained_bytes() - base, 2 * RETAINED_CONTAINER_OVERHEAD_BYTES + 8);
+        let opaque = "x".repeat(1024);
+        for wire in [
+            serde_json::json!({"type": "multi_agent_call", "id": "mac_1", "call_id": "call_1",
+                "action": "send_message", "arguments": opaque}),
+            serde_json::json!({"type": "multi_agent_call_output", "id": "maco_1", "call_id": "call_1",
+                "action": "list_agents", "output": [{"type": "output_text", "text": opaque}]}),
+            serde_json::json!({"type": "agent_message", "id": "amsg_1", "author": "/root/review",
+                "recipient": "/root", "content": [{"type": "encrypted_content", "encrypted_content": opaque}]}),
+        ] {
+            let item: OutputItem = serde_json::from_value(wire).unwrap();
+            let bytes = item.retained_bytes();
+            assert!(bytes > opaque.len());
+            let budget = ExecutorResponseBudget::with_limit(bytes - 1);
+            assert!(RetainedAccount::default().reconcile(Some(&budget), bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn retained_response_bytes_accounts_for_id_and_items() {
+        let payload = ResponsePayload {
+            id: "resp_test".to_owned(),
+            object: "response".to_owned(),
+            created_at: 1000,
+            model: "test".to_owned(),
+            status: "completed".to_owned(),
+            output: vec![OutputItem::Unknown],
+            usage: None,
+            incomplete_details: None,
+            error: None,
+            previous_response_id: None,
+            conversation_id: None,
+            instructions: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let expected = RETAINED_CONTAINER_OVERHEAD_BYTES + "resp_test".len() + RETAINED_CONTAINER_OVERHEAD_BYTES;
+        assert_eq!(retained_response_bytes(&payload), expected);
+        assert_eq!(retained_response_parts_bytes(&payload.id, &payload.output), expected);
+    }
+
+    #[test]
+    fn retained_accounting_for_web_search_mcp_and_reasoning() {
+        let ws_search = OutputItem::WebSearchCall(WebSearchCall {
+            agent: None,
+            id: "ws_1".to_owned(),
+            status: WebSearchCallStatus::Completed,
+            action: WebSearchAction::Search(
+                WebSearchActionSearch::try_new(vec!["query1".to_owned(), "q2".to_owned()], vec![]).unwrap(),
+            ),
+        });
+        // `query` mirrors the first entry of `queries` and is retained separately.
+        assert_eq!(
+            retained_output_item_bytes(&ws_search),
+            RETAINED_CONTAINER_OVERHEAD_BYTES * 3
+                + "search".len()
+                + "ws_1".len()
+                + "query1".len()
+                + ("query1".len() + "q2".len())
+        );
+
+        let ws_open = OutputItem::WebSearchCall(WebSearchCall {
+            agent: None,
+            id: "ws_2".to_owned(),
+            status: WebSearchCallStatus::Completed,
+            action: WebSearchAction::OpenPage(WebSearchActionOpenPage {
+                url: Some("https://example.com".to_owned()),
+            }),
+        });
+        assert_eq!(
+            retained_output_item_bytes(&ws_open),
+            RETAINED_CONTAINER_OVERHEAD_BYTES + "ws_2".len() + "https://example.com".len()
+        );
+
+        let mcp_call = OutputItem::McpCall(McpCall {
+            agent: None,
+            id: "mcp_1".to_owned(),
+            server_label: "srv".to_owned(),
+            name: "tool1".to_owned(),
+            arguments: "{}".to_owned(),
+            status: Some(McpCallStatus::Completed),
+            approval_request_id: None,
+            output: Some("result_output".to_owned()),
+            error: Some(McpCallError::Text("error_msg".to_owned())),
+        });
+        assert_eq!(
+            retained_output_item_bytes(&mcp_call),
+            RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "mcp_1".len()
+                + "srv".len()
+                + "tool1".len()
+                + "{}".len()
+                + "result_output".len()
+                + "error_msg".len()
+        );
+
+        let mcp_list = OutputItem::McpListTools(McpListTools {
+            agent: None,
+            id: "list_1".to_owned(),
+            server_label: "srv".to_owned(),
+            tools: vec![McpListTool {
+                name: "test_tool".to_owned(),
+                description: Some("a tool".to_owned()),
+                input_schema: serde_json::json!({"type": "object", "prop": "val"}),
+                annotations: None,
+            }],
+            error: Some("list_err".to_owned()),
+        });
+        assert!(retained_output_item_bytes(&mcp_list) > RETAINED_CONTAINER_OVERHEAD_BYTES + "list_1".len());
+
+        let reasoning = OutputItem::Reasoning(ReasoningOutput {
+            agent: None,
+            id: "rs_1".to_owned(),
+            status: Some("completed".to_owned()),
+            content: vec![ReasoningTextContent::new("thought")],
+            summary: vec![],
+            encrypted_content: Some(Value::String("encrypted_blob".to_owned())),
+        });
+        assert_eq!(
+            retained_output_item_bytes(&reasoning),
+            RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "rs_1".len()
+                + "completed".len()
+                + RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "encrypted_blob".len()
+                + "reasoning_text".len()
+                + RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "thought".len()
+        );
+    }
+
+    #[test]
+    fn retained_accounting_covers_annotations_compaction_and_nested_arguments() {
+        let annotation = serde_json::json!({"type": "url_citation", "url": "https://example.com", "title": "x"});
+        let mut part = OutputTextContent::new("body");
+        part.annotations = Some(vec![annotation.clone()]);
+        let mut message = OutputMessage::new("msg_1", crate::types::event::MessageStatus::Completed);
+        message.content = vec![part.into()];
+        assert_eq!(
+            retained_output_item_bytes(&OutputItem::Message(message)),
+            RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "msg_1".len()
+                + "assistant".len()
+                + "output_text".len()
+                + RETAINED_CONTAINER_OVERHEAD_BYTES
+                + "body".len()
+                + annotation.retained_bytes()
+        );
+        assert!(annotation.retained_bytes() >= "url_citation".len() + "https://example.com".len());
+
+        let compaction = OutputItem::Compaction(CompactionItem {
+            agent: None,
+            id: Some("cmp_1".to_owned()),
+            encrypted_content: "x".repeat(1000),
+        });
+        assert_eq!(
+            retained_output_item_bytes(&compaction),
+            RETAINED_CONTAINER_OVERHEAD_BYTES + "cmp_1".len() + 1000
+        );
+
+        let nested = serde_json::json!({"query": {"terms": ["a".repeat(100), "b".repeat(200)]}});
+        let tool_search = OutputItem::ToolSearchCall(ToolSearchCall {
+            agent: None,
+            id: "ts_1".to_owned(),
+            call_id: "call_1".to_owned(),
+            execution: crate::types::tools::ToolSearchExecution::Client,
+            arguments: nested.clone(),
+            status: crate::types::tools::ToolSearchStatus::Completed,
+        });
+        assert!(nested.retained_bytes() >= 300);
+        assert_eq!(
+            retained_output_item_bytes(&tool_search),
+            RETAINED_CONTAINER_OVERHEAD_BYTES + "ts_1".len() + "call_1".len() + nested.retained_bytes()
+        );
+    }
+
+    #[test]
+    fn retained_account_charges_grows_and_reconciles_once() {
+        let budget = ExecutorResponseBudget::with_limit(100);
+        let mut account = RetainedAccount::default();
+        account.charge(Some(&budget), 10).unwrap();
+        assert_eq!(account.accounted(), 10);
+
+        // Growth is the measured difference of one mutation, never the payload size.
+        let mut text = String::from("abc");
+        account
+            .grow(Some(&budget), &mut text, String::len, |text| text.push_str("de"))
+            .unwrap();
+        assert_eq!(account.accounted(), 12);
+        account
+            .grow(Some(&budget), &mut text, String::len, |text| *text = "ab".to_owned())
+            .unwrap();
+        assert_eq!(account.accounted(), 12, "shrinking retains the prior charge");
+
+        // Reconciliation charges only the unaccounted remainder, then is idempotent.
+        account.reconcile(Some(&budget), 40).unwrap();
+        assert_eq!(account.accounted(), 40);
+        account.reconcile(Some(&budget), 40).unwrap();
+        account.reconcile(Some(&budget), 30).unwrap();
+        assert_eq!(account.accounted(), 40);
+        assert_eq!(budget.used(), 40);
+
+        let error = account
+            .charge(Some(&budget), 61)
+            .expect_err("budget ceiling is enforced");
+        assert!(matches!(
+            error,
+            ExecutorError::ResourceLimitExceeded {
+                limit: ResourceLimit::ResponseBudget,
+                max_bytes: 100
+            }
+        ));
+        assert_eq!(
+            account.accounted(),
+            40,
+            "a rejected charge leaves the account unchanged"
+        );
     }
 }

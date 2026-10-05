@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::storage::StorageError;
-use crate::types::io::{InputItem, OutputItem};
+use crate::types::io::code_interpreter::CodeInterpreterCallOrigin;
+use crate::types::io::{InputItem, OutputItem, ResponsesInput};
 use crate::utils::common::serialize_to_value;
 
 pub(crate) const STORED_ITEM_KIND_KEY: &str = "_agentic_item_kind";
+pub(crate) const STORED_CODE_INTERPRETER_ORIGIN_KEY: &str = "_agentic_code_interpreter_origin";
 
 /// Item kind (input vs output) for storage and retrieval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +97,16 @@ impl TryFrom<&InOutItem> for String {
                 STORED_ITEM_KIND_KEY.to_string(),
                 Value::String(kind.as_str().to_string()),
             );
+            if matches!(
+                item,
+                InOutItem::Output(OutputItem::CodeInterpreterCall(call))
+                    if call.origin == CodeInterpreterCallOrigin::Gateway
+            ) {
+                obj.insert(
+                    STORED_CODE_INTERPRETER_ORIGIN_KEY.to_owned(),
+                    Value::String("gateway".to_owned()),
+                );
+            }
         }
 
         serde_json::to_string(&value).map_err(StorageError::Serialization)
@@ -106,14 +118,17 @@ impl InOutItem {
     /// Internal items are removed later by `ResponsesInput::model_input`.
     #[must_use]
     pub fn into_input_items(history: Vec<InOutItem>) -> Vec<InputItem> {
-        history
+        let items = history
             .into_iter()
             .filter_map(|item| match item {
                 InOutItem::Input(item) if item.is_unknown() => None,
                 InOutItem::Input(item) => Some(item),
                 InOutItem::Output(output) => output.to_input_item(),
             })
-            .collect()
+            .collect();
+        // Stored inputs retain their public tool types; lower only the history
+        // copy used for continuation, using the same conversion as new inputs.
+        Vec::from(ResponsesInput::Items(items))
     }
 }
 
@@ -121,19 +136,18 @@ impl InOutItem {
 mod tests {
     use super::*;
     use crate::types::event::MessageStatus;
-    use crate::types::io::output::McpListTools;
+    use crate::types::io::output::{McpListTools, MessagePhase};
     use crate::types::io::{
         FunctionToolCall, InputContent, InputMessage, InputMessageContent, OutputMessage, OutputTextContent,
-        ReasoningOutput, ReasoningTextContent, ResponsesInput,
+        ReasoningOutput, ReasoningTextContent, ResponsesInput, ShellCall, ShellCallAction, ShellCallStatus,
     };
 
     #[test]
     fn test_inout_item_from_input() {
         let input = InputItem::Message(InputMessage {
-            id: None,
             role: "user".to_string(),
-            status: None,
             content: InputMessageContent::Text("hello".to_string()),
+            ..Default::default()
         });
         let item: InOutItem = input.into();
         assert!(matches!(item, InOutItem::Input(_)));
@@ -149,10 +163,9 @@ mod tests {
     #[test]
     fn test_inout_item_to_string() {
         let input = InputItem::Message(InputMessage {
-            id: None,
             role: "user".to_string(),
-            status: None,
             content: InputMessageContent::Text("test".to_string()),
+            ..Default::default()
         });
         let item = InOutItem::Input(input);
         let json = String::try_from(&item).expect("serialization failed");
@@ -165,20 +178,19 @@ mod tests {
     #[test]
     fn test_into_input_items_converts_output_messages() {
         let mut output = OutputMessage::new("out1", MessageStatus::Completed);
-        output.content.push(OutputTextContent::new("answer"));
+        output.phase = Some(MessagePhase::FinalAnswer);
+        output.content.push(OutputTextContent::new("answer").into());
         let items = vec![
             InOutItem::Input(InputItem::Message(InputMessage {
-                id: None,
                 role: "user".to_string(),
-                status: None,
                 content: InputMessageContent::Text("msg1".to_string()),
+                ..Default::default()
             })),
             InOutItem::Output(OutputItem::Message(output)),
             InOutItem::Input(InputItem::Message(InputMessage {
-                id: None,
                 role: "user".to_string(),
-                status: None,
                 content: InputMessageContent::Text("msg2".to_string()),
+                ..Default::default()
             })),
         ];
 
@@ -187,6 +199,7 @@ mod tests {
         match &inputs[1] {
             InputItem::Message(message) => {
                 assert_eq!(message.role, "assistant");
+                assert_eq!(message.phase, Some(MessagePhase::FinalAnswer));
                 match &message.content {
                     InputMessageContent::Parts(parts) => {
                         assert_eq!(parts.len(), 1);
@@ -229,6 +242,7 @@ mod tests {
     fn test_into_input_items_preserves_function_calls() {
         use crate::types::event::MessageStatus;
         let fc = FunctionToolCall {
+            agent: None,
             id: "fc_1".to_string(),
             call_id: "call_abc".to_string(),
             name: "my_tool".to_string(),
@@ -243,6 +257,28 @@ mod tests {
         if let InputItem::FunctionCall(f) = &inputs[0] {
             assert_eq!(f.name, "my_tool");
         }
+    }
+
+    #[test]
+    fn test_into_input_items_preserves_shell_calls() {
+        let call = ShellCall {
+            agent: None,
+            id: Some("sh_1".to_owned()),
+            call_id: "call_shell".to_owned(),
+            action: ShellCallAction {
+                commands: vec!["pwd".to_owned()],
+                timeout_ms: Some(crate::types::io::ShellCallLimit::Value(1_000)),
+                max_output_length: Some(crate::types::io::ShellCallLimit::Value(4_096)),
+                extra: std::collections::HashMap::new(),
+            },
+            status: Some(ShellCallStatus::Completed),
+            extra: std::collections::HashMap::new(),
+        };
+
+        let inputs = InOutItem::into_input_items(vec![InOutItem::Output(OutputItem::ShellCall(call))]);
+        assert!(
+            matches!(inputs.as_slice(), [InputItem::FunctionCall(call)] if call.call_id == "call_shell" && call.name == "shell")
+        );
     }
 
     #[test]

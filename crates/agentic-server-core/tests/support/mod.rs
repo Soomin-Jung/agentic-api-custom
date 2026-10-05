@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 
 use agentic_core::executor::{BoxStream, ConversationHandler, ExecutionContext, ResponseHandler};
 use agentic_core::storage::{ConversationStore, DbPool, ResponseStore, create_pool_with_schema};
-use agentic_core::types::io::OutputItem;
+use agentic_core::types::io::{OutputItem, OutputMessageContent};
 use agentic_core::types::request_response::{RequestPayload, ResponsePayload};
 
 #[derive(Debug, Deserialize)]
@@ -100,14 +100,18 @@ pub fn responses_turns(cassette: &Cassette) -> Vec<&Turn> {
 
 /// Extract the expected output text from a cassette turn.
 ///
-/// - Non-streaming: `body.output[0].content[0].text`
+/// - Non-streaming: concatenate message output text, excluding reasoning items.
 /// - Streaming: concatenate all `response.output_text.delta` values
 pub fn expected_text(turn: &Turn) -> String {
     if let Some(body) = &turn.response.body {
-        return body["output"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        return body["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "message")
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter_map(|part| part["text"].as_str())
+            .collect();
     }
     if let Some(sse) = &turn.response.sse {
         let mut out = String::new();
@@ -189,6 +193,7 @@ pub struct MockServer {
     url: String,
     handle: JoinHandle<()>,
     requests: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<http::HeaderMap>>>,
 }
 
 impl MockServer {
@@ -198,6 +203,10 @@ impl MockServer {
 
     pub async fn request_bodies(&self) -> Vec<Value> {
         self.requests.lock().await.clone()
+    }
+
+    pub async fn request_headers(&self) -> Vec<http::HeaderMap> {
+        self.headers.lock().await.clone()
     }
 }
 
@@ -221,6 +230,12 @@ fn build_response(resp: MockResponse) -> Response {
             .body(axum::body::Body::from(body))
             .unwrap()
             .into_response(),
+        MockResponse::Status(status, body) => Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response(),
     }
 }
 
@@ -228,6 +243,8 @@ fn build_response(resp: MockResponse) -> Response {
 pub enum MockResponse {
     Json(String),
     Sse(String),
+    /// A non-2xx JSON error body, as an upstream returns on failure.
+    Status(u16, String),
 }
 
 impl MockResponse {
@@ -251,6 +268,12 @@ impl MockResponse {
 // Use a VecDeque so pop_front is O(1).
 impl MockServer {
     pub async fn start_deque(responses: Vec<MockResponse>) -> Self {
+        Self::start_deque_on("/v1/responses", responses).await
+    }
+
+    /// Queue responses on an arbitrary upstream route (`/v1/messages` for the
+    /// Messages API); everything else matches [`Self::start_deque`].
+    pub async fn start_deque_on(path: &'static str, responses: Vec<MockResponse>) -> Self {
         use std::collections::VecDeque;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -261,18 +284,22 @@ impl MockServer {
         let queue: Arc<Mutex<VecDeque<MockResponse>>> = Arc::new(Mutex::new(VecDeque::from(responses)));
         let requests: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
         let requests_for_route = Arc::clone(&requests);
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let headers_for_route = Arc::clone(&headers);
 
         let handle = tokio::spawn(async move {
             let app = Router::new()
                 .route(
-                    "/v1/responses",
-                    post(move |body: axum::body::Bytes| {
+                    path,
+                    post(move |incoming: http::HeaderMap, body: axum::body::Bytes| {
                         let queue = Arc::clone(&queue);
                         let requests = Arc::clone(&requests_for_route);
+                        let headers = Arc::clone(&headers_for_route);
                         async move {
                             let request_body =
                                 serde_json::from_slice::<Value>(&body).expect("request body should be valid JSON");
                             requests.lock().await.push(request_body);
+                            headers.lock().await.push(incoming);
                             let mut q = queue.lock().await;
                             let resp = q.pop_front().expect("mock queue exhausted — check test setup");
                             build_response(resp)
@@ -289,7 +316,12 @@ impl MockServer {
             axum::serve(listener, app).await.ok();
         });
 
-        Self { url, handle, requests }
+        Self {
+            url,
+            handle,
+            requests,
+            headers,
+        }
     }
 }
 
@@ -308,7 +340,7 @@ pub async fn setup_pool() -> Arc<DbPool> {
 pub struct TestFixture {
     pub exec_ctx: Arc<ExecutionContext>,
     // Kept for its Drop impl — aborts the mock server when the test ends.
-    server: MockServer,
+    pub server: MockServer,
 }
 
 impl TestFixture {
@@ -490,28 +522,14 @@ pub fn make_request(
     conversation_id: Option<String>,
 ) -> RequestPayload {
     RequestPayload {
-        model: "test-model".to_string(),
+        model: "test-model".into(),
         input: serde_json::from_value(serde_json::to_value(input).expect("serialize Responses input"))
             .expect("request should contain valid Responses input"),
-        instructions: None,
         previous_response_id,
         conversation_id,
-        tools: None,
-        tool_choice: None,
         stream,
         store,
-        include: None,
-        reasoning: None,
-        text: None,
-        temperature: None,
-        top_p: None,
-        max_output_tokens: None,
-        ignore_eos: None,
-        truncation: None,
-        metadata: None,
-        parallel_tool_calls: None,
-        cache_salt: None,
-        context_management: None,
+        ..Default::default()
     }
 }
 
@@ -549,16 +567,48 @@ pub fn output_text(payload: &ResponsePayload) -> String {
         .output
         .iter()
         .filter_map(|item| match item {
-            OutputItem::Message(msg) => Some(msg.content.iter().map(|c| c.text.as_str()).collect::<String>()),
+            OutputItem::Message(msg) => Some(msg.content.iter().map(OutputMessageContent::text).collect::<String>()),
             OutputItem::FunctionCall(_)
+            | OutputItem::CodeInterpreterCall(_)
             | OutputItem::ToolSearchCall(_)
             | OutputItem::CustomToolCall(_)
+            | OutputItem::ShellCall(_)
             | OutputItem::WebSearchCall(_)
             | OutputItem::McpCall(_)
             | OutputItem::McpListTools(_)
             | OutputItem::Reasoning(_)
             | OutputItem::Compaction(_)
+            | OutputItem::MultiAgentCall(_)
+            | OutputItem::MultiAgentCallOutput(_)
+            | OutputItem::AgentMessage(_)
             | OutputItem::Unknown => None,
         })
         .collect::<String>()
+}
+
+/// Decodes a request's query string into a JSON object; numeric values become
+/// numbers and repeated keys become arrays, so tests can assert on it directly.
+pub fn query_params_as_json(uri: &axum::http::Uri) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        let value = if let Ok(number) = value.parse::<u64>() {
+            serde_json::Value::from(number)
+        } else {
+            serde_json::Value::String(value.into_owned())
+        };
+        let key = key.into_owned();
+        match params.remove(&key) {
+            None => {
+                params.insert(key, value);
+            }
+            Some(serde_json::Value::Array(mut values)) => {
+                values.push(value);
+                params.insert(key, serde_json::Value::Array(values));
+            }
+            Some(previous) => {
+                params.insert(key, serde_json::Value::Array(vec![previous, value]));
+            }
+        }
+    }
+    serde_json::Value::Object(params)
 }

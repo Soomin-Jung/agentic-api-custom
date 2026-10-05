@@ -6,40 +6,34 @@ backend, not part of the Agentic API product name. Use the base wheel when you w
 
 The Rust-native `agentic` CLI remains supported for `run codex`, `run claude`, `serve`, and `validate`.
 
-## Install the release artifact
+## Install from PyPI
 
-This release produces wheel artifacts for 0.5.0 on supported platforms but does not publish them to PyPI yet.
-Download the wheel for your platform from the release workflow and use its absolute path below:
-
-```bash
-WHEEL_PATH=/absolute/path/to/agentic_api-PLATFORM.whl
-```
+Version 0.8.0 is [published on PyPI](https://pypi.org/project/agentic-api/0.8.0/). Use Python 3.10 or newer.
+The [Python CLI reference](https://vllm-project.github.io/agentic-api/docs/latest/python-cli) lists commands, options, and defaults generated from the parser.
 
 ### Install the base package
 
-Proxy-only installs use the base wheel:
+The base wheel bundles the Rust executables and does not install vLLM:
 
 ```bash
-uv pip install "$WHEEL_PATH"
+python -m pip install agentic-api==0.8.0
 agentic-api serve --vllm-base-url http://existing-vllm:8000
 ```
 
-Use this mode when an external vLLM server is already running and Agentic API should only proxy to it.
+Use this mode when an upstream inference server is already running. Every Python launcher command also works with
+`python -m agentic_api` in place of `agentic-api`.
 
 ### Install the local extra
 
-On supported Linux hosts, local installs add the tested vLLM runtime candidate. The `file://` reference must use the
-absolute wheel path assigned above:
+On supported Linux GPU hosts, the local extra adds the tested vLLM dependency:
 
 ```bash
-uv pip install "agentic-api[local] @ file://$WHEEL_PATH"
+python -m pip install "agentic-api[local]==0.8.0"
 agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8
 ```
 
-The launcher still accepts arbitrary `--model` values. The base package does not install vLLM; the `[local]` extra
-supplies the tested vLLM dependency and makes the managed-vLLM workflow available.
-
-Managed vLLM supports passthrough arguments after `--`:
+The launcher accepts arbitrary `--model` values. Choose a model and serving configuration suitable for your hardware.
+Managed vLLM supports extra arguments after `--`:
 
 ```bash
 agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8 -- \
@@ -47,16 +41,27 @@ agentic-api serve --model Qwen/Qwen3-30B-A3B-FP8 -- \
   --max-model-len=32768
 ```
 
-## After PyPI publication
+The launcher manages `--host`, `--port`, and `--api-key`; do not pass those vLLM options after `--`.
+Use `--vllm-port` and the API-key environment-variable options on the launcher instead.
 
-The following public-index installation and `uvx` commands apply after the PyPI publication gate for a future release.
-They do not work until the package is published:
+### Run with uvx
+
+With uv installed, run the packaged Rust CLI in an isolated environment without a global installation.
+Install Codex or Claude Code separately and connect to an existing inference server:
 
 ```bash
-uv pip install agentic-api
-uv pip install "agentic-api[local]"
-uvx --from agentic-api agentic-api doctor
-uvx --from agentic-api agentic-api serve --vllm-base-url http://existing-vllm:8000
+uvx --from agentic-api==0.8.0 agentic --version
+uvx --from agentic-api==0.8.0 agentic run codex --upstream http://existing-vllm:8000
+uvx --from agentic-api==0.8.0 agentic run claude --upstream http://existing-vllm:8000
+uvx --from agentic-api==0.8.0 agentic serve --upstream http://existing-vllm:8000
+```
+
+### Install a workflow artifact
+
+To test a wheel before publication, download the artifact for your platform from the release workflow:
+
+```bash
+python -m pip install /absolute/path/to/agentic_api-PLATFORM.whl
 ```
 
 ## Check the install
@@ -98,3 +103,10 @@ here are examples that should be revalidated on the target Linux GPU before prom
 
 Other documented model IDs already exercised in this repository include `Qwen/Qwen3.5-35B-A3B-FP8` and
 `Qwen/Qwen3.8-27B-FP8`. Treat them as examples pending hardware revalidation rather than as a CLI allowlist.
+
+## Publishing wheels (maintainers)
+
+See the [release guide](../developing/releases.md) for version preparation, GitHub Actions UI and CLI instructions,
+PyPI Trusted Publishing configuration, the required wheel matrix, registry verification, and recovery from failed or
+partial uploads. PRs and merges build and validate wheels. Trigger the release workflow on `main` to have GitHub
+Actions validate and publish them.

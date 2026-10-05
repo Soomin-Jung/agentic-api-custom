@@ -6,21 +6,24 @@ use crate::executor::{ExecutorError, ExecutorResult};
 use crate::tool::web_search::web_search_function_tool;
 use crate::types::messages::tool_seam::{NATIVE_WEB_SEARCH_TYPE, WEB_SEARCH_EXECUTOR};
 
-/// Request-wide native web-search execution budget.
+/// Request-wide native web-search execution budget, counted in searches.
+#[derive(Debug)]
 pub(super) struct WebSearchBudget {
     remaining: Option<usize>,
 }
 
 impl WebSearchBudget {
-    /// Reserve up to `requested` searches and return how many may execute.
-    pub(super) fn reserve(&mut self, requested: usize) -> usize {
+    /// Admit one call that would perform `searches` searches. The call runs only
+    /// when the remaining budget covers all of them; a refused call leaves the
+    /// budget untouched, so a later call that fits may still run.
+    pub(super) fn admit(&mut self, searches: usize) -> bool {
         match &mut self.remaining {
+            Some(remaining) if searches > *remaining => false,
             Some(remaining) => {
-                let allowed = requested.min(*remaining);
-                *remaining -= allowed;
-                allowed
+                *remaining -= searches;
+                true
             }
-            None => requested,
+            None => true,
         }
     }
 }
@@ -159,16 +162,6 @@ fn native_web_search_max_uses(request: &Value) -> ExecutorResult<Option<usize>> 
     Ok(max_uses)
 }
 
-/// Validate native web-search declarations before an HTTP streaming response
-/// commits its status and headers.
-///
-/// # Errors
-/// Returns [`ExecutorError::InvalidRequest`] when a native declaration uses an
-/// unsupported version or invalid policy configuration.
-pub fn validate_native_web_search_request(request: &Value) -> ExecutorResult<()> {
-    native_web_search_max_uses(request).map(drop)
-}
-
 /// Normalize native web-search declarations for an upstream endpoint that
 /// validates ordinary function-tool schemas, returning whether the body changed.
 ///
@@ -185,10 +178,10 @@ pub fn normalize_native_web_search_for_upstream(request: &mut Value) -> Executor
     normalize_native_web_search(request).map(|_| had_native)
 }
 
-pub(super) fn web_search_budget_exhausted_result(tool_use_id: &str) -> Value {
+pub(super) fn web_search_budget_exhausted_result(tool_use_id: &str) -> crate::types::messages::GatewayToolResult {
     crate::types::messages::tool_seam::tool_result_block(
         tool_use_id,
-        "web_search max_uses exceeded; search was not run",
+        "web_search max_uses exceeded; search was not run".to_owned(),
         true,
     )
 }
